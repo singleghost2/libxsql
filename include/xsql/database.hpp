@@ -255,6 +255,14 @@ public:
         return register_scalar_function(db_, name, argc, std::move(fn));
     }
 
+    int register_function(const char* name, int argc, ScalarFn fn) {
+        if (!db_) {
+            last_error_ = "Database not open";
+            return SQLITE_ERROR;
+        }
+        return register_scalar_function(db_, name, argc, std::move(fn));
+    }
+
     // ========================================================================
     // Query Execution
     // ========================================================================

@@ -41,6 +41,7 @@
 #pragma once
 
 #include <sqlite3.h>
+#include "functions.hpp"
 #include <string>
 #include <vector>
 #include <functional>
@@ -1385,6 +1386,19 @@ public:
         return *this;
     }
 
+    CachedTableBuilder& column_int64_rw(const char* name,
+                                         std::function<int64_t(const RowData&)> getter,
+                                         std::function<bool(RowData&, int64_t)> setter) {
+        def_.columns.emplace_back(name, ColumnType::Integer, true,
+            [getter = std::move(getter)](sqlite3_context* ctx, const RowData& row) {
+                sqlite3_result_int64(ctx, getter(row));
+            },
+            [setter = std::move(setter)](RowData& row, sqlite3_value* val) -> bool {
+                return setter(row, sqlite3_value_int64(val));
+            });
+        return *this;
+    }
+
     CachedTableBuilder& column_int(const char* name, std::function<int(const RowData&)> getter) {
         def_.columns.emplace_back(name, ColumnType::Integer, false,
             [getter = std::move(getter)](sqlite3_context* ctx, const RowData& row) {
@@ -1411,6 +1425,21 @@ public:
                 sqlite3_result_text(ctx, val.c_str(), -1, SQLITE_TRANSIENT);
             },
             std::move(setter));
+        return *this;
+    }
+
+    CachedTableBuilder& column_text_rw(const char* name,
+                                        std::function<std::string(const RowData&)> getter,
+                                        std::function<bool(RowData&, const char*)> setter) {
+        def_.columns.emplace_back(name, ColumnType::Text, true,
+            [getter = std::move(getter)](sqlite3_context* ctx, const RowData& row) {
+                std::string val = getter(row);
+                sqlite3_result_text(ctx, val.c_str(), -1, SQLITE_TRANSIENT);
+            },
+            [setter = std::move(setter)](RowData& row, sqlite3_value* val) -> bool {
+                const char* text = reinterpret_cast<const char*>(sqlite3_value_text(val));
+                return setter(row, text ? text : "");
+            });
         return *this;
     }
 
@@ -1460,6 +1489,15 @@ public:
 
     CachedTableBuilder& row_populator(std::function<void(RowData&, int argc, sqlite3_value** argv)> fn) {
         def_.row_from_argv = std::move(fn);
+        return *this;
+    }
+
+    CachedTableBuilder& row_populator(std::function<void(RowData&, int argc, FunctionArg* argv)> fn) {
+        def_.row_from_argv = [fn = std::move(fn)](RowData& row, int argc, sqlite3_value** argv) {
+            detail::with_args(argc, argv, [&](FunctionArg* args) {
+                fn(row, argc, args);
+            });
+        };
         return *this;
     }
 
