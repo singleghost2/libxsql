@@ -1,0 +1,135 @@
+cmake_minimum_required(VERSION 3.20)
+
+# Enable CMAKE_MSVC_RUNTIME_LIBRARY support (required for IDA SDK compatibility)
+cmake_policy(SET CMP0091 NEW)
+
+project(libxsql VERSION 1.0.0 LANGUAGES C CXX)
+
+# Detect if we're being built standalone or as part of a larger project
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    set(XSQL_STANDALONE ON)
+else()
+    set(XSQL_STANDALONE OFF)
+endif()
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# ============================================================================
+# SQLite
+# ============================================================================
+
+add_subdirectory(external/sqlite)
+
+# ============================================================================
+# nlohmann/json (shared dependency for all xsql projects)
+# ============================================================================
+
+include(FetchContent)
+find_package(nlohmann_json QUIET)
+if(NOT nlohmann_json_FOUND)
+    FetchContent_Declare(
+        nlohmann_json
+        GIT_REPOSITORY https://github.com/nlohmann/json.git
+        GIT_TAG v3.11.3
+        GIT_SHALLOW TRUE
+    )
+    FetchContent_MakeAvailable(nlohmann_json)
+    message(STATUS "libxsql: Fetched nlohmann/json via FetchContent")
+else()
+    message(STATUS "libxsql: Using nlohmann/json via find_package")
+endif()
+
+# ============================================================================
+# libxsql - Header-only library with SQLite dependency
+# ============================================================================
+
+add_library(xsql INTERFACE)
+add_library(xsql::xsql ALIAS xsql)
+
+target_include_directories(xsql INTERFACE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>
+)
+
+target_link_libraries(xsql INTERFACE sqlite3 nlohmann_json::nlohmann_json)
+
+target_compile_features(xsql INTERFACE cxx_std_17)
+
+# ============================================================================
+# Thin Client (optional HTTP server/client)
+# ============================================================================
+
+option(XSQL_WITH_THINCLIENT "Build thin client support (HTTP server/client)" OFF)
+
+if(XSQL_WITH_THINCLIENT)
+    include(FetchContent)
+    FetchContent_Declare(
+        httplib
+        GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
+        GIT_TAG        v0.15.3
+    )
+    FetchContent_MakeAvailable(httplib)
+
+    target_compile_definitions(xsql INTERFACE XSQL_HAS_THINCLIENT)
+    target_link_libraries(xsql INTERFACE httplib::httplib)
+endif()
+
+# Make find_package(xsql) work from build tree
+set(XSQL_EXPORT_TARGETS xsql sqlite3)
+if(XSQL_WITH_THINCLIENT)
+    list(APPEND XSQL_EXPORT_TARGETS httplib)
+endif()
+
+# Include nlohmann_json in export if it was fetched (not system-installed)
+if(TARGET nlohmann_json AND NOT nlohmann_json_FOUND)
+    list(APPEND XSQL_EXPORT_TARGETS nlohmann_json)
+endif()
+
+export(TARGETS ${XSQL_EXPORT_TARGETS}
+    NAMESPACE xsql::
+    FILE "${CMAKE_CURRENT_BINARY_DIR}/xsqlTargets.cmake"
+)
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/xsqlConfig.cmake"
+    "include(\"\${CMAKE_CURRENT_LIST_DIR}/xsqlTargets.cmake\")\n"
+)
+set(xsql_DIR "${CMAKE_CURRENT_BINARY_DIR}" CACHE PATH "xsql config directory" FORCE)
+
+# ============================================================================
+# Examples (optional)
+# ============================================================================
+
+option(XSQL_BUILD_EXAMPLES "Build libxsql examples" ${XSQL_STANDALONE})
+if(XSQL_BUILD_EXAMPLES)
+    add_subdirectory(examples)
+endif()
+
+# ============================================================================
+# Install (for standalone builds)
+# ============================================================================
+
+if(XSQL_STANDALONE)
+    include(GNUInstallDirs)
+
+    set(XSQL_INSTALL_TARGETS xsql sqlite3)
+    if(TARGET nlohmann_json AND NOT nlohmann_json_FOUND)
+        list(APPEND XSQL_INSTALL_TARGETS nlohmann_json)
+    endif()
+
+    install(TARGETS ${XSQL_INSTALL_TARGETS}
+        EXPORT xsqlTargets
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    )
+
+    install(DIRECTORY include/
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    )
+
+    install(EXPORT xsqlTargets
+        FILE xsqlConfig.cmake
+        NAMESPACE xsql::
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/xsql
+    )
+endif()
