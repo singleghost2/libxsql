@@ -24,7 +24,21 @@
 #endif
 #endif
 
+// Guard against macro-defined strtoull (e.g. `#define strtoull _strtoui64`)
+// which breaks httplib's use of std::strtoull
+#ifdef strtoull
+#pragma push_macro("strtoull")
+#undef strtoull
+#define _XSQL_RESTORE_STRTOULL
+#endif
+
 #include <httplib.h>
+
+#ifdef _XSQL_RESTORE_STRTOULL
+#pragma pop_macro("strtoull")
+#undef _XSQL_RESTORE_STRTOULL
+#endif
+
 #include <xsql/json.hpp>
 
 #include <atomic>
