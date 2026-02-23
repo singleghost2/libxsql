@@ -13,6 +13,7 @@
 #pragma once
 
 #include <sqlite3.h>
+#include "status.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -60,7 +61,7 @@ inline bool prepare_next(sqlite3* db,
 
         const char* tail = nullptr;
         int rc = sqlite3_prepare_v2(db, sql, -1, stmt, &tail);
-        if (rc != SQLITE_OK) {
+        if (!xsql::is_ok(rc)) {
             error = sqlite3_errmsg(db);
             return false;
         }
@@ -157,8 +158,8 @@ inline bool execute_script(sqlite3* db,
                 res.columns.push_back(name ? name : "");
             }
 
-            int rc = SQLITE_OK;
-            while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+            int rc = to_sqlite_status(Status::ok);
+            while (xsql::is_row(rc = sqlite3_step(stmt))) {
                 std::vector<std::string> row;
                 row.reserve(static_cast<size_t>(col_count));
                 for (int i = 0; i < col_count; i++) {
@@ -169,7 +170,7 @@ inline bool execute_script(sqlite3* db,
                 res.rows.push_back(std::move(row));
             }
 
-            if (rc != SQLITE_DONE) {
+            if (!xsql::is_done(rc)) {
                 error = sqlite3_errmsg(db);
                 sqlite3_finalize(stmt);
                 return false;
@@ -177,9 +178,9 @@ inline bool execute_script(sqlite3* db,
 
             results.push_back(std::move(res));
         } else {
-            int rc = SQLITE_OK;
-            while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {}
-            if (rc != SQLITE_DONE) {
+            int rc = to_sqlite_status(Status::ok);
+            while (xsql::is_row(rc = sqlite3_step(stmt))) {}
+            if (!xsql::is_done(rc)) {
                 error = sqlite3_errmsg(db);
                 sqlite3_finalize(stmt);
                 return false;
@@ -200,11 +201,11 @@ inline bool export_tables(sqlite3* db,
     if (tables.empty()) {
         const char* sql = "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;";
         sqlite3_stmt* stmt = nullptr;
-        if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        if (!xsql::is_ok(sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr))) {
             error = sqlite3_errmsg(db);
             return false;
         }
-        while (sqlite3_step(stmt) == SQLITE_ROW) {
+        while (xsql::is_row(sqlite3_step(stmt))) {
             const unsigned char* name = sqlite3_column_text(stmt, 0);
             if (name)
                 tables.emplace_back(reinterpret_cast<const char*>(name));
@@ -235,12 +236,12 @@ inline bool export_tables(sqlite3* db,
 
         std::string pragma = "PRAGMA table_info(" + quoted_table + ");";
         sqlite3_stmt* col_stmt = nullptr;
-        if (sqlite3_prepare_v2(db, pragma.c_str(), -1, &col_stmt, nullptr) != SQLITE_OK) {
+        if (!xsql::is_ok(sqlite3_prepare_v2(db, pragma.c_str(), -1, &col_stmt, nullptr))) {
             error = sqlite3_errmsg(db);
             return false;
         }
 
-        while (sqlite3_step(col_stmt) == SQLITE_ROW) {
+        while (xsql::is_row(sqlite3_step(col_stmt))) {
             Column col;
             col.name = reinterpret_cast<const char*>(sqlite3_column_text(col_stmt, 1));
             const unsigned char* type = sqlite3_column_text(col_stmt, 2);
@@ -272,7 +273,7 @@ inline bool export_tables(sqlite3* db,
 
         std::string select = "SELECT * FROM " + quoted_table + ";";
         sqlite3_stmt* data_stmt = nullptr;
-        if (sqlite3_prepare_v2(db, select.c_str(), -1, &data_stmt, nullptr) != SQLITE_OK) {
+        if (!xsql::is_ok(sqlite3_prepare_v2(db, select.c_str(), -1, &data_stmt, nullptr))) {
             error = sqlite3_errmsg(db);
             return false;
         }
@@ -280,8 +281,8 @@ inline bool export_tables(sqlite3* db,
         size_t row_count = 0;
         while (true) {
             int rc = sqlite3_step(data_stmt);
-            if (rc == SQLITE_DONE) break;
-            if (rc != SQLITE_ROW) {
+            if (xsql::is_done(rc)) break;
+            if (!xsql::is_row(rc)) {
                 error = sqlite3_errmsg(db);
                 sqlite3_finalize(data_stmt);
                 return false;

@@ -42,6 +42,7 @@
 
 #include <sqlite3.h>
 #include "functions.hpp"
+#include "status.hpp"
 #include <string>
 #include <vector>
 #include <functional>
@@ -67,6 +68,20 @@ inline void destroy_def(void* p) {
     delete static_cast<T*>(p);
 }
 } // namespace detail
+
+inline thread_local std::string g_vtab_error_message;
+
+inline void clear_vtab_error() {
+    g_vtab_error_message.clear();
+}
+
+inline void set_vtab_error(std::string message) {
+    g_vtab_error_message = std::move(message);
+}
+
+inline const std::string& get_vtab_error() {
+    return g_vtab_error_message;
+}
 
 // ============================================================================ 
 // Column Types
@@ -99,14 +114,14 @@ struct ColumnDef {
     bool writable;
 
     // Getter: Fetch value at row index
-    std::function<void(sqlite3_context*, size_t)> get;
+    std::function<void(FunctionContext&, size_t)> get;
 
     // Setter: Update value at row index (optional, for UPDATE support)
-    std::function<bool(size_t, sqlite3_value*)> set;
+    std::function<bool(size_t, FunctionArg)> set;
 
     ColumnDef(const char* n, ColumnType t, bool w,
-              std::function<void(sqlite3_context*, size_t)> getter,
-              std::function<bool(size_t, sqlite3_value*)> setter = nullptr)
+              std::function<void(FunctionContext&, size_t)> getter,
+              std::function<bool(size_t, FunctionArg)> setter = nullptr)
         : name(n), type(t), writable(w), get(std::move(getter)), set(std::move(setter)) {}
 };
 
@@ -130,8 +145,8 @@ struct RowIterator {
     // True if iterator is exhausted (no current row)
     virtual bool eof() const = 0;
 
-    // Get column value into sqlite3_context
-    virtual void column(sqlite3_context* ctx, int col) = 0;
+    // Get column value into FunctionContext
+    virtual void column(FunctionContext& ctx, int col) = 0;
 
     // Get current row's rowid
     virtual int64_t rowid() const = 0;
@@ -161,10 +176,10 @@ struct FilterDef {
     double estimated_rows;      // Estimated row count
 
     // Factory: create iterator for the given constraint value
-    std::function<std::unique_ptr<RowIterator>(sqlite3_value*)> create;
+    std::function<std::unique_ptr<RowIterator>(FunctionArg)> create;
 
     FilterDef(int col, int id, double cost, double rows,
-              std::function<std::unique_ptr<RowIterator>(sqlite3_value*)> factory)
+              std::function<std::unique_ptr<RowIterator>(FunctionArg)> factory)
         : column_index(col), filter_id(id), estimated_cost(cost),
           estimated_rows(rows), create(std::move(factory)) {}
 };
@@ -194,8 +209,7 @@ struct VTableDef {
     bool supports_delete = false;
 
     // INSERT handler: Insert row with column values, returns success
-    // Values are passed as vector of sqlite3_value* (one per column)
-    std::function<bool(int argc, sqlite3_value** argv)> insert_row;
+    std::function<bool(int argc, FunctionArg* argv)> insert_row;
     bool supports_insert = false;
 
     // Hook called before any modification (INSERT/UPDATE/DELETE)
@@ -258,19 +272,19 @@ inline int vtab_connect(sqlite3* db, void* pAux, int, const char* const*,
     const VTableDef* def = static_cast<const VTableDef*>(pAux);
 
     int rc = sqlite3_declare_vtab(db, def->schema().c_str());
-    if (rc != SQLITE_OK) return rc;
+    if (!xsql::is_ok(rc)) return rc;
 
     auto* vtab = new Vtab();
     memset(&vtab->base, 0, sizeof(vtab->base));
     vtab->def = def;
     *ppVtab = &vtab->base;
-    return SQLITE_OK;
+    return to_sqlite_status(Status::ok);
 }
 
 // xDisconnect/xDestroy
 inline int vtab_disconnect(sqlite3_vtab* pVtab) {
     delete reinterpret_cast<Vtab*>(pVtab);
-    return SQLITE_OK;
+    return to_sqlite_status(Status::ok);
 }
 
 // xOpen
@@ -285,13 +299,13 @@ inline int vtab_open(sqlite3_vtab* pVtab, sqlite3_vtab_cursor** ppCursor) {
     cursor->using_iterator = false;
     cursor->iterator_eof = false;
     *ppCursor = &cursor->base;
-    return SQLITE_OK;
+    return to_sqlite_status(Status::ok);
 }
 
 // xClose
 inline int vtab_close(sqlite3_vtab_cursor* pCursor) {
     delete reinterpret_cast<Cursor*>(pCursor);
-    return SQLITE_OK;
+    return to_sqlite_status(Status::ok);
 }
 
 // xNext
@@ -304,7 +318,7 @@ inline int vtab_next(sqlite3_vtab_cursor* pCursor) {
     } else {
         cursor->idx++;
     }
-    return SQLITE_OK;
+    return to_sqlite_status(Status::ok);
 }
 
 // xEof
@@ -322,18 +336,19 @@ inline int vtab_column(sqlite3_vtab_cursor* pCursor, sqlite3_context* ctx, int c
     auto* cursor = reinterpret_cast<Cursor*>(pCursor);
     if (col < 0 || static_cast<size_t>(col) >= cursor->def->columns.size()) {
         sqlite3_result_null(ctx);
-        return SQLITE_OK;
+        return to_sqlite_status(Status::ok);
     }
+    FunctionContext fctx(ctx);
     if (cursor->using_iterator && cursor->iter) {
         if (cursor->iterator_eof) {
             sqlite3_result_null(ctx);
-            return SQLITE_OK;
+            return to_sqlite_status(Status::ok);
         }
-        cursor->iter->column(ctx, col);
+        cursor->iter->column(fctx, col);
     } else {
-        cursor->def->columns[col].get(ctx, cursor->idx);
+        cursor->def->columns[col].get(fctx, cursor->idx);
     }
-    return SQLITE_OK;
+    return to_sqlite_status(Status::ok);
 }
 
 // xRowid
@@ -342,13 +357,13 @@ inline int vtab_rowid(sqlite3_vtab_cursor* pCursor, sqlite3_int64* pRowid) {
     if (cursor->using_iterator && cursor->iter) {
         if (cursor->iterator_eof) {
             *pRowid = 0;
-            return SQLITE_OK;
+            return to_sqlite_status(Status::ok);
         }
         *pRowid = cursor->iter->rowid();
     } else {
         *pRowid = static_cast<sqlite3_int64>(cursor->idx);
     }
-    return SQLITE_OK;
+    return to_sqlite_status(Status::ok);
 }
 
 // xFilter - get fresh count for iteration or create filtered iterator
@@ -369,20 +384,20 @@ inline int vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const char*,
         for (const auto& filter : cursor->def->filters) {
             if (filter.filter_id == idxNum) {
                 // Create the filtered iterator
-                cursor->iter = filter.create(argv[0]);
+                cursor->iter = filter.create(FunctionArg(argv[0]));
                 cursor->using_iterator = true;
                 cursor->iterator_eof = true;
                 if (cursor->iter) {
                     cursor->iterator_eof = !cursor->iter->next();
                 }
-                return SQLITE_OK;
+                return to_sqlite_status(Status::ok);
             }
         }
     }
 
     // No filter - full scan using index-based iteration
     cursor->total = cursor->def->row_count();
-    return SQLITE_OK;
+    return to_sqlite_status(Status::ok);
 }
 
 // xBestIndex - query planner hook for constraint pushdown
@@ -432,7 +447,7 @@ inline int vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pInfo) {
         pInfo->estimatedRows = full_count;
     }
 
-    return SQLITE_OK;
+    return to_sqlite_status(Status::ok);
 }
 
 // xUpdate - handles INSERT, UPDATE, DELETE
@@ -443,7 +458,7 @@ inline int vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** argv, sqli
     // argc == 1: DELETE
     if (argc == 1 && sqlite3_value_type(argv[0]) != SQLITE_NULL) {
         if (!def->supports_delete || !def->delete_row) {
-            return SQLITE_READONLY;
+            return to_sqlite_status(Status::read_only);
         }
 
         size_t rowid = static_cast<size_t>(sqlite3_value_int64(argv[0]));
@@ -453,9 +468,9 @@ inline int vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** argv, sqli
         }
 
         if (!def->delete_row(rowid)) {
-            return SQLITE_ERROR;
+            return to_sqlite_status(Status::error);
         }
-        return SQLITE_OK;
+        return to_sqlite_status(Status::ok);
     }
 
     // argc > 1, argv[0] != NULL: UPDATE
@@ -467,21 +482,28 @@ inline int vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** argv, sqli
         }
 
         for (size_t i = 2; i < static_cast<size_t>(argc) && (i - 2) < def->columns.size(); ++i) {
+            if (sqlite3_value_nochange(argv[i])) continue;
             size_t col_idx = i - 2;
             const auto& col = def->columns[col_idx];
             if (col.writable && col.set) {
-                if (!col.set(old_rowid, argv[i])) {
-                    return SQLITE_ERROR;
+                clear_vtab_error();
+                if (!col.set(old_rowid, FunctionArg(argv[i]))) {
+                    const std::string& err = get_vtab_error();
+                    if (!err.empty()) {
+                        pVtab->zErrMsg = sqlite3_mprintf("%s", err.c_str());
+                    }
+                    clear_vtab_error();
+                    return to_sqlite_status(Status::error);
                 }
             }
         }
-        return SQLITE_OK;
+        return to_sqlite_status(Status::ok);
     }
 
     // argc > 1, argv[0] == NULL: INSERT
     if (argc > 1 && sqlite3_value_type(argv[0]) == SQLITE_NULL) {
         if (!def->supports_insert || !def->insert_row) {
-            return SQLITE_READONLY;
+            return to_sqlite_status(Status::read_only);
         }
 
         if (def->before_modify) {
@@ -489,13 +511,17 @@ inline int vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** argv, sqli
         }
 
         // Pass column values starting at argv[2] (argv[0]=NULL, argv[1]=rowid)
-        if (!def->insert_row(argc - 2, &argv[2])) {
-            return SQLITE_ERROR;
+        bool ok = false;
+        detail::with_args(argc - 2, &argv[2], [&](FunctionArg* args) {
+            ok = def->insert_row(argc - 2, args);
+        });
+        if (!ok) {
+            return to_sqlite_status(Status::error);
         }
-        return SQLITE_OK;
+        return to_sqlite_status(Status::ok);
     }
 
-    return SQLITE_READONLY;
+    return to_sqlite_status(Status::read_only);
 }
 
 // Create module with xUpdate support
@@ -535,7 +561,7 @@ inline bool register_vtable(sqlite3* db, const char* module_name, const VTableDe
 
     int rc = sqlite3_create_module_v2(db, module_name, &get_module(),
                                       owned, &detail::destroy_def<VTableDef>);
-    if (rc != SQLITE_OK) {
+    if (!xsql::is_ok(rc)) {
         delete owned;
         return false;
     }
@@ -561,7 +587,7 @@ inline bool create_vtable(sqlite3* db, const char* table_name, const char* modul
     char* err = nullptr;
     int rc = sqlite3_exec(db, sql.c_str(), nullptr, nullptr, &err);
     if (err) sqlite3_free(err);
-    return rc == SQLITE_OK;
+    return xsql::is_ok(rc);
 }
 
 // ============================================================================
@@ -596,8 +622,8 @@ public:
     // Read-only integer column (int64)
     VTableBuilder& column_int64(const char* name, std::function<int64_t(size_t)> getter) {
         def_.columns.emplace_back(name, ColumnType::Integer, false,
-            [getter = std::move(getter)](sqlite3_context* ctx, size_t idx) {
-                sqlite3_result_int64(ctx, getter(idx));
+            [getter = std::move(getter)](FunctionContext& ctx, size_t idx) {
+                ctx.result_int64(getter(idx));
             },
             nullptr);
         return *this;
@@ -608,11 +634,11 @@ public:
                                     std::function<int64_t(size_t)> getter,
                                     std::function<bool(size_t, int64_t)> setter) {
         def_.columns.emplace_back(name, ColumnType::Integer, true,
-            [getter = std::move(getter)](sqlite3_context* ctx, size_t idx) {
-                sqlite3_result_int64(ctx, getter(idx));
+            [getter = std::move(getter)](FunctionContext& ctx, size_t idx) {
+                ctx.result_int64(getter(idx));
             },
-            [setter = std::move(setter)](size_t idx, sqlite3_value* val) -> bool {
-                return setter(idx, sqlite3_value_int64(val));
+            [setter = std::move(setter)](size_t idx, FunctionArg val) -> bool {
+                return setter(idx, val.as_int64());
             });
         return *this;
     }
@@ -620,8 +646,8 @@ public:
     // Read-only integer column (int)
     VTableBuilder& column_int(const char* name, std::function<int(size_t)> getter) {
         def_.columns.emplace_back(name, ColumnType::Integer, false,
-            [getter = std::move(getter)](sqlite3_context* ctx, size_t idx) {
-                sqlite3_result_int(ctx, getter(idx));
+            [getter = std::move(getter)](FunctionContext& ctx, size_t idx) {
+                ctx.result_int(getter(idx));
             },
             nullptr);
         return *this;
@@ -632,11 +658,11 @@ public:
                                   std::function<int(size_t)> getter,
                                   std::function<bool(size_t, int)> setter) {
         def_.columns.emplace_back(name, ColumnType::Integer, true,
-            [getter = std::move(getter)](sqlite3_context* ctx, size_t idx) {
-                sqlite3_result_int(ctx, getter(idx));
+            [getter = std::move(getter)](FunctionContext& ctx, size_t idx) {
+                ctx.result_int(getter(idx));
             },
-            [setter = std::move(setter)](size_t idx, sqlite3_value* val) -> bool {
-                return setter(idx, sqlite3_value_int(val));
+            [setter = std::move(setter)](size_t idx, FunctionArg val) -> bool {
+                return setter(idx, val.as_int());
             });
         return *this;
     }
@@ -644,9 +670,8 @@ public:
     // Read-only text column
     VTableBuilder& column_text(const char* name, std::function<std::string(size_t)> getter) {
         def_.columns.emplace_back(name, ColumnType::Text, false,
-            [getter = std::move(getter)](sqlite3_context* ctx, size_t idx) {
-                std::string val = getter(idx);
-                sqlite3_result_text(ctx, val.c_str(), -1, SQLITE_TRANSIENT);
+            [getter = std::move(getter)](FunctionContext& ctx, size_t idx) {
+                ctx.result_text(getter(idx));
             },
             nullptr);
         return *this;
@@ -657,12 +682,11 @@ public:
                                    std::function<std::string(size_t)> getter,
                                    std::function<bool(size_t, const char*)> setter) {
         def_.columns.emplace_back(name, ColumnType::Text, true,
-            [getter = std::move(getter)](sqlite3_context* ctx, size_t idx) {
-                std::string val = getter(idx);
-                sqlite3_result_text(ctx, val.c_str(), -1, SQLITE_TRANSIENT);
+            [getter = std::move(getter)](FunctionContext& ctx, size_t idx) {
+                ctx.result_text(getter(idx));
             },
-            [setter = std::move(setter)](size_t idx, sqlite3_value* val) -> bool {
-                const char* text = reinterpret_cast<const char*>(sqlite3_value_text(val));
+            [setter = std::move(setter)](size_t idx, FunctionArg val) -> bool {
+                const char* text = val.as_c_str();
                 return setter(idx, text ? text : "");
             });
         return *this;
@@ -671,8 +695,8 @@ public:
     // Read-only double column
     VTableBuilder& column_double(const char* name, std::function<double(size_t)> getter) {
         def_.columns.emplace_back(name, ColumnType::Real, false,
-            [getter = std::move(getter)](sqlite3_context* ctx, size_t idx) {
-                sqlite3_result_double(ctx, getter(idx));
+            [getter = std::move(getter)](FunctionContext& ctx, size_t idx) {
+                ctx.result_double(getter(idx));
             },
             nullptr);
         return *this;
@@ -681,9 +705,9 @@ public:
     // Read-only blob column
     VTableBuilder& column_blob(const char* name, std::function<std::vector<uint8_t>(size_t)> getter) {
         def_.columns.emplace_back(name, ColumnType::Blob, false,
-            [getter = std::move(getter)](sqlite3_context* ctx, size_t idx) {
+            [getter = std::move(getter)](FunctionContext& ctx, size_t idx) {
                 auto val = getter(idx);
-                sqlite3_result_blob(ctx, val.data(), static_cast<int>(val.size()), SQLITE_TRANSIENT);
+                ctx.result_blob(val.data(), val.size());
             },
             nullptr);
         return *this;
@@ -696,12 +720,19 @@ public:
         return *this;
     }
 
-    // Enable INSERT support
-    // The callback receives (argc, argv) where argv contains column values
-    // Column order matches the schema definition
-    VTableBuilder& insertable(std::function<bool(int argc, sqlite3_value** argv)> insert_fn) {
+    // Enable INSERT support with wrapped FunctionArg values.
+    VTableBuilder& insertable(std::function<bool(int argc, FunctionArg* argv)> insert_fn) {
         def_.supports_insert = true;
         def_.insert_row = std::move(insert_fn);
+        return *this;
+    }
+
+    // Legacy INSERT overload (raw sqlite3 values).
+    VTableBuilder& insertable(std::function<bool(int argc, sqlite3_value** argv)> insert_fn) {
+        def_.supports_insert = true;
+        def_.insert_row = [insert_fn = std::move(insert_fn)](int argc, FunctionArg* argv) -> bool {
+            return insert_fn(argc, reinterpret_cast<sqlite3_value**>(argv));
+        };
         return *this;
     }
 
@@ -740,9 +771,8 @@ public:
 
         def_.filters.emplace_back(
             col_idx, filter_id, cost, est_rows,
-            [factory = std::move(factory)](sqlite3_value* val) -> std::unique_ptr<RowIterator> {
-                int64_t value = sqlite3_value_int64(val);
-                return factory(value);
+            [factory = std::move(factory)](FunctionArg val) -> std::unique_ptr<RowIterator> {
+                return factory(val.as_int64());
             }
         );
         return *this;
@@ -762,8 +792,8 @@ public:
 
         def_.filters.emplace_back(
             col_idx, filter_id, cost, est_rows,
-            [factory = std::move(factory)](sqlite3_value* val) -> std::unique_ptr<RowIterator> {
-                const char* text = reinterpret_cast<const char*>(sqlite3_value_text(val));
+            [factory = std::move(factory)](FunctionArg val) -> std::unique_ptr<RowIterator> {
+                const char* text = val.as_c_str();
                 return factory(text ? text : "");
             }
         );
@@ -817,12 +847,12 @@ struct CachedColumnDef {
     std::string name;
     ColumnType type;
     bool writable;
-    std::function<void(sqlite3_context*, const RowData&)> get;
-    std::function<bool(RowData&, sqlite3_value*)> set;
+    std::function<void(FunctionContext&, const RowData&)> get;
+    std::function<bool(RowData&, FunctionArg)> set;
 
     CachedColumnDef(const char* n, ColumnType t, bool w,
-                    std::function<void(sqlite3_context*, const RowData&)> getter,
-                    std::function<bool(RowData&, sqlite3_value*)> setter = nullptr)
+                    std::function<void(FunctionContext&, const RowData&)> getter,
+                    std::function<bool(RowData&, FunctionArg)> setter = nullptr)
         : name(n), type(t), writable(w), get(std::move(getter)), set(std::move(setter)) {}
 };
 
@@ -851,17 +881,24 @@ struct CachedTableDef {
     std::vector<FilterDef> filters;
     std::function<bool(RowData&)> delete_row;
     bool supports_delete = false;
+    std::function<bool(int argc, FunctionArg* argv)> insert_row;
+    bool supports_insert = false;
     std::function<void(const std::string&)> before_modify;
 
     // Populate a RowData from xUpdate argv values (argv[2..] = column values).
     // Used when the shared cache is not available (e.g., filter_eq path).
     // If not set, UPDATE only works when the shared cache contains the row.
-    std::function<void(RowData&, int argc, sqlite3_value** argv)> row_from_argv;
+    std::function<void(RowData&, int argc, FunctionArg* argv)> row_from_argv;
+
+    // Optional row lookup by rowid for UPDATE/DELETE fallback.
+    // Useful for filter iterators whose rowid is not a positional index.
+    std::function<bool(RowData&, int64_t)> row_lookup;
 
     // Index definitions: column index -> key extractor
     std::vector<std::pair<int, std::function<int64_t(const RowData&)>>> index_defs;
 
     // Shared cache - lazily built on first query, shared across all cursors
+    bool use_shared_cache = true;
     mutable std::shared_ptr<SharedCache<RowData>> shared_cache;
 
     std::string schema() const {
@@ -899,6 +936,7 @@ struct CachedTableDef {
 
     // Ensure shared cache is built (thread-safe, lazy initialization)
     void ensure_cache_built() const {
+        if (!use_shared_cache) return;
         if (!shared_cache) {
             shared_cache = std::make_shared<SharedCache<RowData>>();
         }
@@ -964,18 +1002,18 @@ inline int cached_vtab_connect(sqlite3* db, void* pAux, int, const char* const*,
                                sqlite3_vtab** ppVtab, char**) {
     const auto* def = static_cast<const CachedTableDef<RowData>*>(pAux);
     int rc = sqlite3_declare_vtab(db, def->schema().c_str());
-    if (rc != SQLITE_OK) return rc;
+    if (!xsql::is_ok(rc)) return rc;
     auto* vtab = new CachedVtab<RowData>();
     memset(&vtab->base, 0, sizeof(vtab->base));
     vtab->def = def;
     *ppVtab = &vtab->base;
-    return SQLITE_OK;
+    return to_sqlite_status(Status::ok);
 }
 
 template<typename RowData>
 inline int cached_vtab_disconnect(sqlite3_vtab* pVtab) {
     delete reinterpret_cast<CachedVtab<RowData>*>(pVtab);
-    return SQLITE_OK;
+    return to_sqlite_status(Status::ok);
 }
 
 template<typename RowData>
@@ -990,13 +1028,13 @@ inline int cached_vtab_open(sqlite3_vtab* pVtab, sqlite3_vtab_cursor** ppCursor)
     cursor->using_iterator = false;
     cursor->iterator_eof = false;
     *ppCursor = &cursor->base;
-    return SQLITE_OK;
+    return to_sqlite_status(Status::ok);
 }
 
 template<typename RowData>
 inline int cached_vtab_close(sqlite3_vtab_cursor* pCursor) {
     delete reinterpret_cast<CachedCursor<RowData>*>(pCursor);
-    return SQLITE_OK;
+    return to_sqlite_status(Status::ok);
 }
 
 template<typename RowData>
@@ -1011,7 +1049,7 @@ inline int cached_vtab_next(sqlite3_vtab_cursor* pCursor) {
     } else {
         cursor->current_row++;
     }
-    return SQLITE_OK;
+    return to_sqlite_status(Status::ok);
 }
 
 template<typename RowData>
@@ -1026,7 +1064,7 @@ inline int cached_vtab_eof(sqlite3_vtab_cursor* pCursor) {
         return cursor->index_pos >= cursor->index_matches->size() ? 1 : 0;
     }
     // Full scan using shared cache
-    if (cursor->def->shared_cache && cursor->def->shared_cache->built) {
+    if (cursor->def->use_shared_cache && cursor->def->shared_cache && cursor->def->shared_cache->built) {
         return cursor->current_row >= cursor->def->shared_cache->data.size() ? 1 : 0;
     }
     return cursor->current_row >= cursor->cache.size() ? 1 : 0;
@@ -1037,21 +1075,22 @@ inline int cached_vtab_column(sqlite3_vtab_cursor* pCursor, sqlite3_context* ctx
     auto* cursor = reinterpret_cast<CachedCursor<RowData>*>(pCursor);
     if (col < 0 || static_cast<size_t>(col) >= cursor->def->columns.size()) {
         sqlite3_result_null(ctx);
-        return SQLITE_OK;
+        return to_sqlite_status(Status::ok);
     }
+    FunctionContext fctx(ctx);
     if (cursor->using_iterator && cursor->iterator) {
         if (cursor->iterator_eof) {
             sqlite3_result_null(ctx);
-            return SQLITE_OK;
+            return to_sqlite_status(Status::ok);
         }
-        cursor->iterator->column(ctx, col);
+        cursor->iterator->column(fctx, col);
     } else if (cursor->using_index) {
         // Index-based access: get row from shared cache via index
         if (cursor->index_matches && cursor->index_pos < cursor->index_matches->size()) {
             size_t row_idx = (*cursor->index_matches)[cursor->index_pos];
             const auto& shared = cursor->def->shared_cache;
             if (shared && row_idx < shared->data.size()) {
-                cursor->def->columns[col].get(ctx, shared->data[row_idx]);
+                cursor->def->columns[col].get(fctx, shared->data[row_idx]);
             } else {
                 sqlite3_result_null(ctx);
             }
@@ -1061,15 +1100,15 @@ inline int cached_vtab_column(sqlite3_vtab_cursor* pCursor, sqlite3_context* ctx
     } else {
         // Full scan: use shared cache if available, else local cache
         const auto& shared = cursor->def->shared_cache;
-        if (shared && shared->built && cursor->current_row < shared->data.size()) {
-            cursor->def->columns[col].get(ctx, shared->data[cursor->current_row]);
+        if (cursor->def->use_shared_cache && shared && shared->built && cursor->current_row < shared->data.size()) {
+            cursor->def->columns[col].get(fctx, shared->data[cursor->current_row]);
         } else if (cursor->current_row < cursor->cache.size()) {
-            cursor->def->columns[col].get(ctx, cursor->cache[cursor->current_row]);
+            cursor->def->columns[col].get(fctx, cursor->cache[cursor->current_row]);
         } else {
             sqlite3_result_null(ctx);
         }
     }
-    return SQLITE_OK;
+    return to_sqlite_status(Status::ok);
 }
 
 template<typename RowData>
@@ -1078,13 +1117,13 @@ inline int cached_vtab_rowid(sqlite3_vtab_cursor* pCursor, sqlite3_int64* pRowid
     if (cursor->using_iterator && cursor->iterator) {
         if (cursor->iterator_eof) {
             *pRowid = 0;
-            return SQLITE_OK;
+            return to_sqlite_status(Status::ok);
         }
         *pRowid = cursor->iterator->rowid();
     } else {
         *pRowid = static_cast<sqlite3_int64>(cursor->current_row);
     }
-    return SQLITE_OK;
+    return to_sqlite_status(Status::ok);
 }
 
 template<typename RowData>
@@ -1105,7 +1144,7 @@ inline int cached_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const ch
 
     if (idxNum != FILTER_NONE && argc > 0) {
         // Check for index-based lookup (idxNum >= INDEX_BASE)
-        if (idxNum >= INDEX_BASE) {
+        if (cursor->def->use_shared_cache && idxNum >= INDEX_BASE) {
             int index_pos = idxNum - INDEX_BASE;
             const auto& index_defs = cursor->def->index_defs;
             if (index_pos >= 0 && static_cast<size_t>(index_pos) < index_defs.size()) {
@@ -1113,7 +1152,7 @@ inline int cached_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const ch
                 cursor->def->ensure_cache_built();
                 const auto& shared = cursor->def->shared_cache;
                 if (shared && shared->built && static_cast<size_t>(index_pos) < shared->indexes.size()) {
-                    int64_t key = sqlite3_value_int64(argv[0]);
+                    int64_t key = FunctionArg(argv[0]).as_int64();
                     auto it = shared->indexes[index_pos].find(key);
                     if (it != shared->indexes[index_pos].end()) {
                         cursor->using_index = true;
@@ -1124,7 +1163,7 @@ inline int cached_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const ch
                         cursor->using_index = true;
                         cursor->index_matches = nullptr;
                     }
-                    return SQLITE_OK;
+                    return to_sqlite_status(Status::ok);
                 }
             }
         }
@@ -1132,23 +1171,29 @@ inline int cached_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const ch
         // Check for filter-based lookup
         for (const auto& filter : cursor->def->filters) {
             if (filter.filter_id == idxNum) {
-                cursor->iterator = filter.create(argv[0]);
+                cursor->iterator = filter.create(FunctionArg(argv[0]));
                 cursor->using_iterator = true;
                 cursor->iterator_eof = true;
                 if (cursor->iterator) {
                     cursor->iterator_eof = !cursor->iterator->next();
                 }
-                return SQLITE_OK;
+                return to_sqlite_status(Status::ok);
             }
         }
     }
 
-    // Full scan - use shared cache if available
-    cursor->def->ensure_cache_built();
+    // Full scan - use shared cache or query-local cache depending on table policy.
+    if (cursor->def->use_shared_cache) {
+        cursor->def->ensure_cache_built();
+    } else if (cursor->def->cache_builder_fn) {
+        cursor->cache.clear();
+        cursor->def->cache_builder_fn(cursor->cache);
+        cursor->cache_built = true;
+    }
     cursor->using_iterator = false;
     cursor->using_index = false;
     cursor->current_row = 0;
-    return SQLITE_OK;
+    return to_sqlite_status(Status::ok);
 }
 
 template<typename RowData>
@@ -1177,7 +1222,7 @@ inline int cached_vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pInfo
         }
 
         // Check for indexed column
-        int idx_pos = def->find_index(constraint.iColumn);
+        int idx_pos = def->use_shared_cache ? def->find_index(constraint.iColumn) : -1;
         if (idx_pos >= 0) {
             // Index lookups are very cheap (hash lookup)
             double index_cost = 1.0;
@@ -1213,7 +1258,7 @@ inline int cached_vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pInfo
         pInfo->estimatedCost = static_cast<double>(estimated_rows);
         pInfo->estimatedRows = estimated_rows;
     }
-    return SQLITE_OK;
+    return to_sqlite_status(Status::ok);
 }
 
 template<typename RowData>
@@ -1224,36 +1269,55 @@ inline int cached_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** arg
     // argc == 1: DELETE
     if (argc == 1 && sqlite3_value_type(argv[0]) != SQLITE_NULL) {
         if (!def->supports_delete || !def->delete_row) {
-            return SQLITE_READONLY;
+            return to_sqlite_status(Status::read_only);
         }
 
-        size_t rowid = static_cast<size_t>(sqlite3_value_int64(argv[0]));
+        const int64_t raw_rowid = sqlite3_value_int64(argv[0]);
+        const size_t rowid = raw_rowid >= 0 ? static_cast<size_t>(raw_rowid) : static_cast<size_t>(-1);
+
         const auto& shared = def->shared_cache;
-        if (!shared || !shared->built || rowid >= shared->data.size()) {
-            return SQLITE_ERROR;
+        RowData temp_row{};
+        RowData* row_ptr = nullptr;
+
+        if (shared && shared->built && raw_rowid >= 0 && rowid < shared->data.size()) {
+            row_ptr = &shared->data[rowid];
+        } else if (def->row_lookup && def->row_lookup(temp_row, raw_rowid)) {
+            row_ptr = &temp_row;
+        } else if (!def->use_shared_cache && def->cache_builder_fn && raw_rowid >= 0) {
+            std::vector<RowData> rows;
+            def->cache_builder_fn(rows);
+            if (rowid < rows.size()) {
+                temp_row = std::move(rows[rowid]);
+                row_ptr = &temp_row;
+            }
+        }
+
+        if (!row_ptr) {
+            return to_sqlite_status(Status::error);
         }
 
         if (def->before_modify) {
             def->before_modify("DELETE FROM " + def->name);
         }
 
-        if (!def->delete_row(shared->data[rowid])) {
-            return SQLITE_ERROR;
+        if (!def->delete_row(*row_ptr)) {
+            return to_sqlite_status(Status::error);
         }
         def->invalidate_cache();
-        return SQLITE_OK;
+        return to_sqlite_status(Status::ok);
     }
 
     // argc > 1, argv[0] != NULL: UPDATE
     if (argc > 1 && sqlite3_value_type(argv[0]) != SQLITE_NULL) {
-        size_t old_rowid = static_cast<size_t>(sqlite3_value_int64(argv[0]));
+        const int64_t raw_rowid = sqlite3_value_int64(argv[0]);
+        const size_t old_rowid = raw_rowid >= 0 ? static_cast<size_t>(raw_rowid) : static_cast<size_t>(-1);
 
         // Check if any column is writable
         bool has_writable = false;
         for (const auto& col : def->columns) {
             if (col.writable && col.set) { has_writable = true; break; }
         }
-        if (!has_writable) return SQLITE_READONLY;
+        if (!has_writable) return to_sqlite_status(Status::read_only);
 
         if (def->before_modify) {
             def->before_modify("UPDATE " + def->name);
@@ -1265,32 +1329,70 @@ inline int cached_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** arg
         RowData* row_ptr = nullptr;
         RowData temp_row{};
 
-        if (shared && shared->built && old_rowid < shared->data.size()) {
+        if (shared && shared->built && raw_rowid >= 0 && old_rowid < shared->data.size()) {
             row_ptr = &shared->data[old_rowid];
         } else if (def->row_from_argv) {
             // Build temp row from argv column values.
             // Handles the filter_eq path where rows come from an iterator.
-            def->row_from_argv(temp_row, argc, argv);
+            detail::with_args(argc, argv, [&](FunctionArg* args) {
+                def->row_from_argv(temp_row, argc, args);
+            });
             row_ptr = &temp_row;
+        } else if (def->row_lookup && def->row_lookup(temp_row, raw_rowid)) {
+            row_ptr = &temp_row;
+        } else if (!def->use_shared_cache && def->cache_builder_fn && raw_rowid >= 0) {
+            std::vector<RowData> rows;
+            def->cache_builder_fn(rows);
+            if (old_rowid < rows.size()) {
+                temp_row = std::move(rows[old_rowid]);
+                row_ptr = &temp_row;
+            }
         } else {
-            return SQLITE_READONLY;
+            return to_sqlite_status(Status::read_only);
         }
 
         for (size_t i = 2; i < static_cast<size_t>(argc) && (i - 2) < def->columns.size(); ++i) {
+            if (sqlite3_value_nochange(argv[i])) continue;
             size_t col_idx = i - 2;
             const auto& col = def->columns[col_idx];
             if (col.writable && col.set) {
-                if (!col.set(*row_ptr, argv[i])) {
-                    return SQLITE_ERROR;
+                clear_vtab_error();
+                if (!col.set(*row_ptr, FunctionArg(argv[i]))) {
+                    const std::string& err = get_vtab_error();
+                    if (!err.empty()) {
+                        pVtab->zErrMsg = sqlite3_mprintf("%s", err.c_str());
+                    }
+                    clear_vtab_error();
+                    return to_sqlite_status(Status::error);
                 }
             }
         }
         def->invalidate_cache();
-        return SQLITE_OK;
+        return to_sqlite_status(Status::ok);
     }
 
-    // INSERT not supported for cached tables
-    return SQLITE_READONLY;
+    // argc > 1, argv[0] == NULL: INSERT
+    if (argc > 1 && sqlite3_value_type(argv[0]) == SQLITE_NULL) {
+        if (!def->supports_insert || !def->insert_row) {
+            return to_sqlite_status(Status::read_only);
+        }
+
+        if (def->before_modify) {
+            def->before_modify("INSERT INTO " + def->name);
+        }
+
+        bool ok = false;
+        detail::with_args(argc - 2, &argv[2], [&](FunctionArg* args) {
+            ok = def->insert_row(argc - 2, args);
+        });
+        if (!ok) {
+            return to_sqlite_status(Status::error);
+        }
+        def->invalidate_cache();
+        return to_sqlite_status(Status::ok);
+    }
+
+    return to_sqlite_status(Status::read_only);
 }
 
 template<typename RowData>
@@ -1335,7 +1437,7 @@ inline bool register_cached_vtable(sqlite3* db, const char* module_name,
         &detail::destroy_def<CachedTableDef<RowData>>
     );
 
-    if (rc != SQLITE_OK) {
+    if (!xsql::is_ok(rc)) {
         delete owned;
         return false;
     }
@@ -1350,6 +1452,7 @@ public:
     explicit CachedTableBuilder(const char* name) {
         def_.name = name;
         def_.supports_delete = false;
+        def_.supports_insert = false;
     }
 
     CachedTableBuilder& estimate_rows(std::function<size_t()> fn) {
@@ -1362,6 +1465,13 @@ public:
         return *this;
     }
 
+    // Force query-lived cache (no shared persistent cache across queries).
+    CachedTableBuilder& no_shared_cache() {
+        def_.use_shared_cache = false;
+        def_.shared_cache.reset();
+        return *this;
+    }
+
     CachedTableBuilder& on_modify(std::function<void(const std::string&)> fn) {
         def_.before_modify = std::move(fn);
         return *this;
@@ -1369,18 +1479,18 @@ public:
 
     CachedTableBuilder& column_int64(const char* name, std::function<int64_t(const RowData&)> getter) {
         def_.columns.emplace_back(name, ColumnType::Integer, false,
-            [getter = std::move(getter)](sqlite3_context* ctx, const RowData& row) {
-                sqlite3_result_int64(ctx, getter(row));
+            [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
+                ctx.result_int64(getter(row));
             }, nullptr);
         return *this;
     }
 
     CachedTableBuilder& column_int64_rw(const char* name,
                                          std::function<int64_t(const RowData&)> getter,
-                                         std::function<bool(RowData&, sqlite3_value*)> setter) {
+                                         std::function<bool(RowData&, FunctionArg)> setter) {
         def_.columns.emplace_back(name, ColumnType::Integer, true,
-            [getter = std::move(getter)](sqlite3_context* ctx, const RowData& row) {
-                sqlite3_result_int64(ctx, getter(row));
+            [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
+                ctx.result_int64(getter(row));
             },
             std::move(setter));
         return *this;
@@ -1390,39 +1500,61 @@ public:
                                          std::function<int64_t(const RowData&)> getter,
                                          std::function<bool(RowData&, int64_t)> setter) {
         def_.columns.emplace_back(name, ColumnType::Integer, true,
-            [getter = std::move(getter)](sqlite3_context* ctx, const RowData& row) {
-                sqlite3_result_int64(ctx, getter(row));
+            [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
+                ctx.result_int64(getter(row));
             },
-            [setter = std::move(setter)](RowData& row, sqlite3_value* val) -> bool {
-                return setter(row, sqlite3_value_int64(val));
+            [setter = std::move(setter)](RowData& row, FunctionArg val) -> bool {
+                return setter(row, val.as_int64());
             });
         return *this;
     }
 
     CachedTableBuilder& column_int(const char* name, std::function<int(const RowData&)> getter) {
         def_.columns.emplace_back(name, ColumnType::Integer, false,
-            [getter = std::move(getter)](sqlite3_context* ctx, const RowData& row) {
-                sqlite3_result_int(ctx, getter(row));
+            [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
+                ctx.result_int(getter(row));
             }, nullptr);
+        return *this;
+    }
+
+    CachedTableBuilder& column_int_rw(const char* name,
+                                       std::function<int(const RowData&)> getter,
+                                       std::function<bool(RowData&, FunctionArg)> setter) {
+        def_.columns.emplace_back(name, ColumnType::Integer, true,
+            [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
+                ctx.result_int(getter(row));
+            },
+            std::move(setter));
+        return *this;
+    }
+
+    CachedTableBuilder& column_int_rw(const char* name,
+                                       std::function<int(const RowData&)> getter,
+                                       std::function<bool(RowData&, int)> setter) {
+        def_.columns.emplace_back(name, ColumnType::Integer, true,
+            [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
+                ctx.result_int(getter(row));
+            },
+            [setter = std::move(setter)](RowData& row, FunctionArg val) -> bool {
+                return setter(row, val.as_int());
+            });
         return *this;
     }
 
     CachedTableBuilder& column_text(const char* name, std::function<std::string(const RowData&)> getter) {
         def_.columns.emplace_back(name, ColumnType::Text, false,
-            [getter = std::move(getter)](sqlite3_context* ctx, const RowData& row) {
-                std::string val = getter(row);
-                sqlite3_result_text(ctx, val.c_str(), -1, SQLITE_TRANSIENT);
+            [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
+                ctx.result_text(getter(row));
             }, nullptr);
         return *this;
     }
 
     CachedTableBuilder& column_text_rw(const char* name,
                                         std::function<std::string(const RowData&)> getter,
-                                        std::function<bool(RowData&, sqlite3_value*)> setter) {
+                                        std::function<bool(RowData&, FunctionArg)> setter) {
         def_.columns.emplace_back(name, ColumnType::Text, true,
-            [getter = std::move(getter)](sqlite3_context* ctx, const RowData& row) {
-                std::string val = getter(row);
-                sqlite3_result_text(ctx, val.c_str(), -1, SQLITE_TRANSIENT);
+            [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
+                ctx.result_text(getter(row));
             },
             std::move(setter));
         return *this;
@@ -1432,12 +1564,11 @@ public:
                                         std::function<std::string(const RowData&)> getter,
                                         std::function<bool(RowData&, const char*)> setter) {
         def_.columns.emplace_back(name, ColumnType::Text, true,
-            [getter = std::move(getter)](sqlite3_context* ctx, const RowData& row) {
-                std::string val = getter(row);
-                sqlite3_result_text(ctx, val.c_str(), -1, SQLITE_TRANSIENT);
+            [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
+                ctx.result_text(getter(row));
             },
-            [setter = std::move(setter)](RowData& row, sqlite3_value* val) -> bool {
-                const char* text = reinterpret_cast<const char*>(sqlite3_value_text(val));
+            [setter = std::move(setter)](RowData& row, FunctionArg val) -> bool {
+                const char* text = val.as_c_str();
                 return setter(row, text ? text : "");
             });
         return *this;
@@ -1445,17 +1576,17 @@ public:
 
     CachedTableBuilder& column_double(const char* name, std::function<double(const RowData&)> getter) {
         def_.columns.emplace_back(name, ColumnType::Real, false,
-            [getter = std::move(getter)](sqlite3_context* ctx, const RowData& row) {
-                sqlite3_result_double(ctx, getter(row));
+            [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
+                ctx.result_double(getter(row));
             }, nullptr);
         return *this;
     }
 
     CachedTableBuilder& column_blob(const char* name, std::function<std::vector<uint8_t>(const RowData&)> getter) {
         def_.columns.emplace_back(name, ColumnType::Blob, false,
-            [getter = std::move(getter)](sqlite3_context* ctx, const RowData& row) {
+            [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
                 auto val = getter(row);
-                sqlite3_result_blob(ctx, val.data(), static_cast<int>(val.size()), SQLITE_TRANSIENT);
+                ctx.result_blob(val.data(), val.size());
             }, nullptr);
         return *this;
     }
@@ -1467,8 +1598,8 @@ public:
         if (col_idx < 0) return *this;
         int filter_id = static_cast<int>(def_.filters.size()) + 1;
         def_.filters.emplace_back(col_idx, filter_id, cost, est_rows,
-            [factory = std::move(factory)](sqlite3_value* val) -> std::unique_ptr<RowIterator> {
-                return factory(sqlite3_value_int64(val));
+            [factory = std::move(factory)](FunctionArg val) -> std::unique_ptr<RowIterator> {
+                return factory(val.as_int64());
             });
         return *this;
     }
@@ -1480,30 +1611,47 @@ public:
         if (col_idx < 0) return *this;
         int filter_id = static_cast<int>(def_.filters.size()) + 1;
         def_.filters.emplace_back(col_idx, filter_id, cost, est_rows,
-            [factory = std::move(factory)](sqlite3_value* val) -> std::unique_ptr<RowIterator> {
-                const char* text = reinterpret_cast<const char*>(sqlite3_value_text(val));
+            [factory = std::move(factory)](FunctionArg val) -> std::unique_ptr<RowIterator> {
+                const char* text = val.as_c_str();
                 return factory(text ? text : "");
             });
         return *this;
     }
 
     CachedTableBuilder& row_populator(std::function<void(RowData&, int argc, sqlite3_value** argv)> fn) {
-        def_.row_from_argv = std::move(fn);
+        def_.row_from_argv = [fn = std::move(fn)](RowData& row, int argc, FunctionArg* argv) {
+            fn(row, argc, reinterpret_cast<sqlite3_value**>(argv));
+        };
         return *this;
     }
 
     CachedTableBuilder& row_populator(std::function<void(RowData&, int argc, FunctionArg* argv)> fn) {
-        def_.row_from_argv = [fn = std::move(fn)](RowData& row, int argc, sqlite3_value** argv) {
-            detail::with_args(argc, argv, [&](FunctionArg* args) {
-                fn(row, argc, args);
-            });
-        };
+        def_.row_from_argv = std::move(fn);
+        return *this;
+    }
+
+    CachedTableBuilder& row_lookup(std::function<bool(RowData&, int64_t)> fn) {
+        def_.row_lookup = std::move(fn);
         return *this;
     }
 
     CachedTableBuilder& deletable(std::function<bool(RowData&)> delete_fn) {
         def_.supports_delete = true;
         def_.delete_row = std::move(delete_fn);
+        return *this;
+    }
+
+    CachedTableBuilder& insertable(std::function<bool(int argc, FunctionArg* argv)> insert_fn) {
+        def_.supports_insert = true;
+        def_.insert_row = std::move(insert_fn);
+        return *this;
+    }
+
+    CachedTableBuilder& insertable(std::function<bool(int argc, sqlite3_value** argv)> insert_fn) {
+        def_.supports_insert = true;
+        def_.insert_row = [insert_fn = std::move(insert_fn)](int argc, FunctionArg* argv) -> bool {
+            return insert_fn(argc, reinterpret_cast<sqlite3_value**>(argv));
+        };
         return *this;
     }
 
@@ -1530,8 +1678,12 @@ public:
     }
 
     CachedTableDef<RowData> build() {
-        // Pre-create the shared cache so all copies share the same instance
-        def_.shared_cache = std::make_shared<SharedCache<RowData>>();
+        // Pre-create shared cache only when requested.
+        if (def_.use_shared_cache) {
+            def_.shared_cache = std::make_shared<SharedCache<RowData>>();
+        } else {
+            def_.shared_cache.reset();
+        }
         return std::move(def_);
     }
 };
@@ -1567,7 +1719,7 @@ struct Generator {
     virtual const RowData& current() const = 0;
 
     // Current rowid (valid only after next() returns true)
-    virtual sqlite3_int64 rowid() const = 0;
+    virtual int64_t rowid() const = 0;
 };
 
 template<typename RowData>
@@ -1627,18 +1779,18 @@ inline int generator_vtab_connect(sqlite3* db, void* pAux, int, const char* cons
                                   sqlite3_vtab** ppVtab, char**) {
     const auto* def = static_cast<const GeneratorTableDef<RowData>*>(pAux);
     int rc = sqlite3_declare_vtab(db, def->schema().c_str());
-    if (rc != SQLITE_OK) return rc;
+    if (!xsql::is_ok(rc)) return rc;
     auto* vtab = new GeneratorVtab<RowData>();
     memset(&vtab->base, 0, sizeof(vtab->base));
     vtab->def = def;
     *ppVtab = &vtab->base;
-    return SQLITE_OK;
+    return to_sqlite_status(Status::ok);
 }
 
 template<typename RowData>
 inline int generator_vtab_disconnect(sqlite3_vtab* pVtab) {
     delete reinterpret_cast<GeneratorVtab<RowData>*>(pVtab);
-    return SQLITE_OK;
+    return to_sqlite_status(Status::ok);
 }
 
 template<typename RowData>
@@ -1653,13 +1805,13 @@ inline int generator_vtab_open(sqlite3_vtab* pVtab, sqlite3_vtab_cursor** ppCurs
     cursor->using_iterator = false;
     cursor->iterator_eof = false;
     *ppCursor = &cursor->base;
-    return SQLITE_OK;
+    return to_sqlite_status(Status::ok);
 }
 
 template<typename RowData>
 inline int generator_vtab_close(sqlite3_vtab_cursor* pCursor) {
     delete reinterpret_cast<GeneratorCursor<RowData>*>(pCursor);
-    return SQLITE_OK;
+    return to_sqlite_status(Status::ok);
 }
 
 template<typename RowData>
@@ -1674,7 +1826,7 @@ inline int generator_vtab_next(sqlite3_vtab_cursor* pCursor) {
             cursor->generator_eof = true;
         }
     }
-    return SQLITE_OK;
+    return to_sqlite_status(Status::ok);
 }
 
 template<typename RowData>
@@ -1692,25 +1844,26 @@ inline int generator_vtab_column(sqlite3_vtab_cursor* pCursor, sqlite3_context* 
     auto* cursor = reinterpret_cast<GeneratorCursor<RowData>*>(pCursor);
     if (col < 0 || static_cast<size_t>(col) >= cursor->def->columns.size()) {
         sqlite3_result_null(ctx);
-        return SQLITE_OK;
+        return to_sqlite_status(Status::ok);
     }
 
+    FunctionContext fctx(ctx);
     if (cursor->using_iterator && cursor->iterator) {
         if (cursor->iterator_eof) {
             sqlite3_result_null(ctx);
-            return SQLITE_OK;
+            return to_sqlite_status(Status::ok);
         }
-        cursor->iterator->column(ctx, col);
-        return SQLITE_OK;
+        cursor->iterator->column(fctx, col);
+        return to_sqlite_status(Status::ok);
     }
 
     if (!cursor->generator || cursor->generator_eof) {
         sqlite3_result_null(ctx);
-        return SQLITE_OK;
+        return to_sqlite_status(Status::ok);
     }
 
-    cursor->def->columns[col].get(ctx, cursor->generator->current());
-    return SQLITE_OK;
+    cursor->def->columns[col].get(fctx, cursor->generator->current());
+    return to_sqlite_status(Status::ok);
 }
 
 template<typename RowData>
@@ -1719,19 +1872,19 @@ inline int generator_vtab_rowid(sqlite3_vtab_cursor* pCursor, sqlite3_int64* pRo
     if (cursor->using_iterator && cursor->iterator) {
         if (cursor->iterator_eof) {
             *pRowid = 0;
-            return SQLITE_OK;
+            return to_sqlite_status(Status::ok);
         }
         *pRowid = cursor->iterator->rowid();
-        return SQLITE_OK;
+        return to_sqlite_status(Status::ok);
     }
 
     if (!cursor->generator || cursor->generator_eof) {
         *pRowid = 0;
-        return SQLITE_OK;
+        return to_sqlite_status(Status::ok);
     }
 
-    *pRowid = cursor->generator->rowid();
-    return SQLITE_OK;
+    *pRowid = static_cast<sqlite3_int64>(cursor->generator->rowid());
+    return to_sqlite_status(Status::ok);
 }
 
 template<typename RowData>
@@ -1748,13 +1901,13 @@ inline int generator_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const
     if (idxNum != FILTER_NONE && argc > 0) {
         for (const auto& filter : cursor->def->filters) {
             if (filter.filter_id == idxNum) {
-                cursor->iterator = filter.create(argv[0]);
+                cursor->iterator = filter.create(FunctionArg(argv[0]));
                 cursor->using_iterator = true;
                 cursor->iterator_eof = true;
                 if (cursor->iterator) {
                     cursor->iterator_eof = !cursor->iterator->next();
                 }
-                return SQLITE_OK;
+                return to_sqlite_status(Status::ok);
             }
         }
     }
@@ -1768,7 +1921,7 @@ inline int generator_vtab_filter(sqlite3_vtab_cursor* pCursor, int idxNum, const
             cursor->generator_eof = !cursor->generator->next();
         }
     }
-    return SQLITE_OK;
+    return to_sqlite_status(Status::ok);
 }
 
 template<typename RowData>
@@ -1808,12 +1961,12 @@ inline int generator_vtab_best_index(sqlite3_vtab* pVtab, sqlite3_index_info* pI
         pInfo->estimatedCost = static_cast<double>(estimated_rows);
         pInfo->estimatedRows = estimated_rows;
     }
-    return SQLITE_OK;
+    return to_sqlite_status(Status::ok);
 }
 
 template<typename RowData>
 inline int generator_vtab_update(sqlite3_vtab*, int, sqlite3_value**, sqlite3_int64*) {
-    return SQLITE_READONLY;
+    return to_sqlite_status(Status::read_only);
 }
 
 template<typename RowData>
@@ -1858,7 +2011,7 @@ inline bool register_generator_vtable(sqlite3* db, const char* module_name,
         &detail::destroy_def<GeneratorTableDef<RowData>>
     );
 
-    if (rc != SQLITE_OK) {
+    if (!xsql::is_ok(rc)) {
         delete owned;
         return false;
     }
@@ -1886,42 +2039,41 @@ public:
 
     GeneratorTableBuilder& column_int64(const char* name, std::function<int64_t(const RowData&)> getter) {
         def_.columns.emplace_back(name, ColumnType::Integer, false,
-            [getter = std::move(getter)](sqlite3_context* ctx, const RowData& row) {
-                sqlite3_result_int64(ctx, getter(row));
+            [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
+                ctx.result_int64(getter(row));
             }, nullptr);
         return *this;
     }
 
     GeneratorTableBuilder& column_int(const char* name, std::function<int(const RowData&)> getter) {
         def_.columns.emplace_back(name, ColumnType::Integer, false,
-            [getter = std::move(getter)](sqlite3_context* ctx, const RowData& row) {
-                sqlite3_result_int(ctx, getter(row));
+            [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
+                ctx.result_int(getter(row));
             }, nullptr);
         return *this;
     }
 
     GeneratorTableBuilder& column_text(const char* name, std::function<std::string(const RowData&)> getter) {
         def_.columns.emplace_back(name, ColumnType::Text, false,
-            [getter = std::move(getter)](sqlite3_context* ctx, const RowData& row) {
-                std::string val = getter(row);
-                sqlite3_result_text(ctx, val.c_str(), -1, SQLITE_TRANSIENT);
+            [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
+                ctx.result_text(getter(row));
             }, nullptr);
         return *this;
     }
 
     GeneratorTableBuilder& column_double(const char* name, std::function<double(const RowData&)> getter) {
         def_.columns.emplace_back(name, ColumnType::Real, false,
-            [getter = std::move(getter)](sqlite3_context* ctx, const RowData& row) {
-                sqlite3_result_double(ctx, getter(row));
+            [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
+                ctx.result_double(getter(row));
             }, nullptr);
         return *this;
     }
 
     GeneratorTableBuilder& column_blob(const char* name, std::function<std::vector<uint8_t>(const RowData&)> getter) {
         def_.columns.emplace_back(name, ColumnType::Blob, false,
-            [getter = std::move(getter)](sqlite3_context* ctx, const RowData& row) {
+            [getter = std::move(getter)](FunctionContext& ctx, const RowData& row) {
                 auto val = getter(row);
-                sqlite3_result_blob(ctx, val.data(), static_cast<int>(val.size()), SQLITE_TRANSIENT);
+                ctx.result_blob(val.data(), val.size());
             }, nullptr);
         return *this;
     }
@@ -1933,8 +2085,8 @@ public:
         if (col_idx < 0) return *this;
         int filter_id = static_cast<int>(def_.filters.size()) + 1;
         def_.filters.emplace_back(col_idx, filter_id, cost, est_rows,
-            [factory = std::move(factory)](sqlite3_value* val) -> std::unique_ptr<RowIterator> {
-                return factory(sqlite3_value_int64(val));
+            [factory = std::move(factory)](FunctionArg val) -> std::unique_ptr<RowIterator> {
+                return factory(val.as_int64());
             });
         return *this;
     }
@@ -1946,8 +2098,8 @@ public:
         if (col_idx < 0) return *this;
         int filter_id = static_cast<int>(def_.filters.size()) + 1;
         def_.filters.emplace_back(col_idx, filter_id, cost, est_rows,
-            [factory = std::move(factory)](sqlite3_value* val) -> std::unique_ptr<RowIterator> {
-                const char* text = reinterpret_cast<const char*>(sqlite3_value_text(val));
+            [factory = std::move(factory)](FunctionArg val) -> std::unique_ptr<RowIterator> {
+                const char* text = val.as_c_str();
                 return factory(text ? text : "");
             });
         return *this;

@@ -6,8 +6,8 @@
  *
  * Provides the standard 5 endpoints (/, /help, /query, /status, /shutdown)
  * with two execution modes:
- *   - Direct: query callback runs on httplib worker thread (bnsql-style)
- *   - Command-queue: queries are queued for main-thread execution (idasql-style)
+ *   - Direct: query callback runs on httplib worker thread
+ *   - Command-queue: queries are queued for main-thread execution
  *
  * Replaces the per-tool *HTTPServer classes with a single reusable implementation.
  */
@@ -60,7 +60,7 @@ namespace xsql::thinclient {
 // ============================================================================
 
 struct http_query_server_config {
-    /// Tool name shown in responses (e.g., "idasql", "bnsql")
+    /// Tool name shown in responses
     std::string tool_name;
 
     /// Help text returned by GET /help
@@ -92,9 +92,25 @@ struct http_query_server_config {
     using extra_routes_fn_t = std::function<void(httplib::Server& svr)>;
     extra_routes_fn_t extra_routes;
 
+    /// Queue wait timeout in milliseconds for use_queue mode.
+    /// 0 means wait indefinitely.
+    int queue_admission_timeout_ms = 60000;
+
+    /// Maximum queued requests in use_queue mode.
+    /// 0 means unbounded.
+    size_t max_queue = 0;
+
+    /// Optional dynamic queue timeout callback (overrides queue_admission_timeout_ms).
+    using queue_timeout_fn_t = std::function<int()>;
+    queue_timeout_fn_t queue_admission_timeout_ms_fn;
+
+    /// Optional dynamic max queue callback (overrides max_queue).
+    using max_queue_fn_t = std::function<size_t()>;
+    max_queue_fn_t max_queue_fn;
+
     /// If true, queries are queued for main-thread execution via
     /// run_until_stopped() / process_one_command(). Required for tools
-    /// with thread-affinity constraints (e.g., idasql/Hex-Rays).
+    /// with thread-affinity constraints.
     bool use_queue = false;
 };
 
@@ -234,22 +250,45 @@ private:
         auto cmd = std::make_shared<pending_command>();
         cmd->sql = sql;
 
+        int queue_timeout_ms = config_.queue_admission_timeout_ms;
+        if (config_.queue_admission_timeout_ms_fn) {
+            queue_timeout_ms = config_.queue_admission_timeout_ms_fn();
+        }
+        if (queue_timeout_ms < 0) {
+            queue_timeout_ms = 0;
+        }
+
         {
             std::lock_guard<std::mutex> lock(queue_mutex_);
+            size_t max_queue = config_.max_queue;
+            if (config_.max_queue_fn) {
+                max_queue = config_.max_queue_fn();
+            }
+            if (max_queue > 0 && pending_commands_.size() >= max_queue) {
+                return xsql::json{
+                    {"success", false},
+                    {"error", "Queue full"},
+                    {"hint", "Reduce concurrency or increase max_queue"}
+                }.dump();
+            }
             pending_commands_.push(cmd);
         }
         queue_cv_.notify_one();
 
-        // Wait for main thread to execute with 60s timeout
+        // Wait for main thread to execute.
         {
             std::unique_lock<std::mutex> lock(cmd->done_mutex);
-            int wait_count = 0;
-            while (!cmd->completed && wait_count < 600) {
-                cmd->done_cv.wait_for(lock, std::chrono::milliseconds(100));
-                wait_count++;
-            }
-            if (!cmd->completed) {
-                return xsql::json{{"success", false}, {"error", "Request timed out"}}.dump();
+            if (queue_timeout_ms == 0) {
+                while (!cmd->completed) {
+                    cmd->done_cv.wait_for(lock, std::chrono::milliseconds(100));
+                }
+            } else if (!cmd->done_cv.wait_for(lock, std::chrono::milliseconds(queue_timeout_ms),
+                                              [&]() { return cmd->completed; })) {
+                return xsql::json{
+                    {"success", false},
+                    {"error", "Request timed out while waiting in queue"},
+                    {"hint", "Reduce concurrency or increase queue_admission_timeout_ms"}
+                }.dump();
             }
         }
 
@@ -503,6 +542,12 @@ struct http_query_server_config {
     status_fn_t status_fn;
     using extra_routes_fn_t = std::function<void(int)>;
     extra_routes_fn_t extra_routes;
+    int queue_admission_timeout_ms = 60000;
+    size_t max_queue = 0;
+    using queue_timeout_fn_t = std::function<int()>;
+    queue_timeout_fn_t queue_admission_timeout_ms_fn;
+    using max_queue_fn_t = std::function<size_t()>;
+    max_queue_fn_t max_queue_fn;
     bool use_queue = false;
 };
 

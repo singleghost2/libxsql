@@ -194,51 +194,39 @@ auto def = xsql::cached_table<XrefInfo>("xrefs")
 
 With this filter, `SELECT * FROM xrefs WHERE to_ea = 0x401000` uses the native xref API instead of scanning all rows.
 
-## Socket Server/Client
+## HTTP Thinclient
 
-Serve tables over TCP with length-prefixed JSON protocol.
+Serve tables over HTTP with `xsql::thinclient::server` and query them with standard HTTP clients.
 
 ### Server
 
 ```cpp
-#include <xsql/socket/socket.hpp>
+#include <xsql/thinclient/server.hpp>
 
-xsql::socket::Server server;
-// Optional: require an auth token from clients
-// xsql::socket::ServerConfig cfg;
-// cfg.auth_token = "secret";
-// server.set_config(cfg);
+xsql::thinclient::server_config cfg;
+cfg.port = 8081;
+cfg.bind_address = "127.0.0.1";
+cfg.auth_token = "secret";
+cfg.setup_routes = [&](httplib::Server& svr) {
+    svr.Post("/query", [&](const httplib::Request& req, httplib::Response& res) {
+        auto result = db.query(req.body);
+        res.status = result.ok() ? 200 : 400;
+        res.set_content(result.to_string(), "text/plain");
+    });
+};
 
-server.set_query_handler([&](const std::string& sql) {
-    auto result = db.query(sql);
-    xsql::socket::QueryResult qr;
-    qr.success = result.ok();
-    qr.error = result.error;
-    qr.columns = result.columns;
-    for (const auto& row : result) {
-        qr.rows.push_back(row.values);
-    }
-    return qr;
-});
-server.run(12345);  // Blocking
+xsql::thinclient::server server(cfg);
+server.run();
 ```
 
 ### Client
 
 ```cpp
-#include <xsql/socket/socket.hpp>
+#include <xsql/thinclient/client.hpp>
 
-xsql::socket::Client client;
-// Optional: if server requires a token
-// client.set_auth_token("secret");
-if (client.connect("localhost", 12345)) {
-    auto result = client.query("SELECT * FROM items LIMIT 10");
-    if (result.success) {
-        for (const auto& row : result.rows) {
-            printf("%s\n", row[0].c_str());
-        }
-    }
-}
+xsql::thinclient::client client({.host = "127.0.0.1", .port = 8081});
+std::string result = client.query("SELECT * FROM items LIMIT 10");
+printf("%s\n", result.c_str());
 ```
 
 ## API Reference
@@ -284,11 +272,11 @@ libxsql is designed for building CLI tools that AI coding agents can query direc
 ### The Pattern
 
 1. Your application exposes data as virtual tables
-2. A thin CLI client connects via socket and runs SQL
+2. A thin client (or curl) sends SQL over HTTP
 3. Agents invoke the CLI and parse results
 
 ```
-┌─────────────────┐     SQL over TCP     ┌─────────────┐
+┌─────────────────┐      SQL over HTTP    ┌─────────────┐
 │  Your App       │◄────────────────────►│  CLI Client │
 │  (libxsql)      │                      │  (thin)     │
 │                 │                      └──────┬──────┘
@@ -319,20 +307,22 @@ auto funcs = xsql::table("funcs")
     .column_int("size", [&](size_t i) { return functions[i].size; })
     .build();
 
-// Start server
-xsql::socket::Server server;
-server.set_query_handler([&](const std::string& sql) { /* ... */ });
-server.run(13337);
+// Start HTTP server
+xsql::thinclient::server_config cfg;
+cfg.port = 8081;
+cfg.setup_routes = [&](httplib::Server& svr) { /* ... */ };
+xsql::thinclient::server server(cfg);
+server.run();
 ```
 
 Now an agent can:
 
 ```bash
 # Find largest functions
-mytool --remote localhost:13337 -q "SELECT name, size FROM funcs ORDER BY size DESC LIMIT 10"
+curl -X POST http://localhost:8081/query -d "SELECT name, size FROM funcs ORDER BY size DESC LIMIT 10"
 
 # Search for patterns
-mytool --remote localhost:13337 -q "SELECT * FROM strings WHERE content LIKE '%password%'"
+curl -X POST http://localhost:8081/query -d "SELECT * FROM strings WHERE content LIKE '%password%'"
 ```
 
 The agent writes SQL. Your tool executes it. No glue code required.

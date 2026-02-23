@@ -11,3 +11,4 @@
 #include <xsql/thinclient/cli.hpp>
 #include <xsql/thinclient/server.hpp>
 #include <xsql/thinclient/client.hpp>
+#include <xsql/thinclient/clipboard.hpp>

@@ -15,6 +15,7 @@
 #pragma once
 
 #include <sqlite3.h>
+#include "status.hpp"
 #include <string>
 #include <functional>
 #include <cstdint>
@@ -49,9 +50,29 @@ public:
     int bytes() const { return sqlite3_value_bytes(val_); }
     int type() const { return sqlite3_value_type(val_); }
     bool is_null() const { return sqlite3_value_type(val_) == SQLITE_NULL; }
+    bool is_nochange() const { return sqlite3_value_nochange(val_) != 0; }
 
     // Escape hatch: get underlying sqlite3_value*
     sqlite3_value* raw() const { return val_; }
+};
+
+/**
+ * Read-only wrapper for a row returned by an internal query.
+ *
+ * Tool code can inspect values without calling sqlite3_column_* directly.
+ */
+class QueryRow {
+    sqlite3_stmt* stmt_;
+public:
+    explicit QueryRow(sqlite3_stmt* stmt) : stmt_(stmt) {}
+
+    const char* text(int col) const {
+        return reinterpret_cast<const char*>(sqlite3_column_text(stmt_, col));
+    }
+    int int_value(int col) const { return sqlite3_column_int(stmt_, col); }
+    int64_t int64_value(int col) const { return sqlite3_column_int64(stmt_, col); }
+    double double_value(int col) const { return sqlite3_column_double(stmt_, col); }
+    bool is_null(int col) const { return sqlite3_column_type(stmt_, col) == SQLITE_NULL; }
 };
 
 /**
@@ -89,6 +110,44 @@ public:
 
     // Escape hatch: get database handle for schema queries
     sqlite3* db_handle() { return sqlite3_context_db_handle(ctx_); }
+
+    /**
+     * Execute a query and invoke callback for each row.
+     * Returns false on SQL error and optionally writes the DB error message.
+     */
+    template<typename Fn>
+    bool query_each(const std::string& sql, Fn&& fn, std::string* error = nullptr) {
+        sqlite3* db = sqlite3_context_db_handle(ctx_);
+        if (!db) {
+            if (error) *error = "No database handle";
+            return false;
+        }
+
+        sqlite3_stmt* stmt = nullptr;
+        int rc = sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
+        if (!xsql::is_ok(rc)) {
+            if (error) *error = sqlite3_errmsg(db);
+            return false;
+        }
+
+        while (xsql::is_row(rc = sqlite3_step(stmt))) {
+            fn(QueryRow(stmt));
+        }
+
+        if (!xsql::is_done(rc)) {
+            if (error) *error = sqlite3_errmsg(db);
+            sqlite3_finalize(stmt);
+            return false;
+        }
+
+        sqlite3_finalize(stmt);
+        return true;
+    }
+
+    std::string db_error() const {
+        sqlite3* db = sqlite3_context_db_handle(ctx_);
+        return db ? std::string(sqlite3_errmsg(db)) : std::string("No database handle");
+    }
 
     // Escape hatch: get underlying sqlite3_context*
     sqlite3_context* raw() const { return ctx_; }
@@ -237,7 +296,7 @@ inline void destroy_scalar_fn_wrapper(void* ptr) {
 } // namespace detail
 
 /// Register a raw SQL function (legacy, requires sqlite3.h)
-inline int register_scalar_function(
+inline Status register_scalar_function(
     sqlite3* db,
     const char* name,
     int argc,
@@ -256,14 +315,14 @@ inline int register_scalar_function(
         nullptr,
         detail::destroy_wrapper
     );
-    if (rc != SQLITE_OK) {
+    if (!xsql::is_ok(rc)) {
         delete wrapper;
     }
-    return rc;
+    return to_status(rc);
 }
 
 /// Register a wrapped SQL function using ScalarFn
-inline int register_scalar_function(
+inline Status register_scalar_function(
     sqlite3* db,
     const char* name,
     int argc,
@@ -282,10 +341,10 @@ inline int register_scalar_function(
         nullptr,
         detail::destroy_scalar_fn_wrapper
     );
-    if (rc != SQLITE_OK) {
+    if (!xsql::is_ok(rc)) {
         delete wrapper;
     }
-    return rc;
+    return to_status(rc);
 }
 
 } // namespace xsql

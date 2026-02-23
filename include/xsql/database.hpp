@@ -28,6 +28,9 @@
 
 #include "vtable.hpp"
 #include "functions.hpp"
+#include "script.hpp"
+#include "status.hpp"
+#include <chrono>
 #include <memory>
 #include <utility>
 
@@ -46,10 +49,24 @@ struct Row {
     bool empty() const { return values.empty(); }
 };
 
+struct QueryOptions {
+    // Timeout for query execution in milliseconds.
+    // 0 means disabled (legacy behavior).
+    int timeout_ms = 0;
+
+    // SQLite VM instructions between timeout checks.
+    // Lower values improve responsiveness at the cost of overhead.
+    int progress_steps = 1000;
+};
+
 struct Result {
     std::vector<std::string> columns;
     std::vector<Row> rows;
     std::string error;
+    std::vector<std::string> warnings;
+    bool timed_out = false;
+    bool partial = false;
+    int elapsed_ms = 0;
 
     bool ok() const { return error.empty(); }
     size_t size() const { return rows.size(); }
@@ -105,7 +122,7 @@ public:
     bool open(const char* path = ":memory:") {
         close();
         int rc = sqlite3_open(path, &db_);
-        if (rc != SQLITE_OK) {
+        if (!is_ok(rc)) {
             last_error_ = db_ ? sqlite3_errmsg(db_) : "Failed to allocate database";
             if (db_) {
                 sqlite3_close(db_);
@@ -247,18 +264,18 @@ public:
     // Function Registration
     // ========================================================================
 
-    int register_function(const char* name, int argc, SqlScalarFn fn) {
+    Status register_function(const char* name, int argc, SqlScalarFn fn) {
         if (!db_) {
             last_error_ = "Database not open";
-            return SQLITE_ERROR;
+            return Status::error;
         }
         return register_scalar_function(db_, name, argc, std::move(fn));
     }
 
-    int register_function(const char* name, int argc, ScalarFn fn) {
+    Status register_function(const char* name, int argc, ScalarFn fn) {
         if (!db_) {
             last_error_ = "Database not open";
-            return SQLITE_ERROR;
+            return Status::error;
         }
         return register_scalar_function(db_, name, argc, std::move(fn));
     }
@@ -268,6 +285,10 @@ public:
     // ========================================================================
 
     Result query(const char* sql) {
+        return query(sql, QueryOptions{});
+    }
+
+    Result query(const char* sql, const QueryOptions& options) {
         Result result;
 
         if (!db_) {
@@ -277,10 +298,44 @@ public:
 
         sqlite3_stmt* stmt = nullptr;
         int rc = sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr);
-        if (rc != SQLITE_OK) {
+        if (!is_ok(rc)) {
             result.error = sqlite3_errmsg(db_);
             return result;
         }
+
+        struct timeout_state_t {
+            std::chrono::steady_clock::time_point started_at{};
+            int timeout_ms = 0;
+            bool timed_out = false;
+        };
+
+        struct progress_handler_t {
+            static int callback(void* user_data) {
+                auto* state = static_cast<timeout_state_t*>(user_data);
+                if (!state || state->timeout_ms <= 0) {
+                    return 0;
+                }
+
+                const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - state->started_at).count();
+                if (elapsed_ms >= state->timeout_ms) {
+                    state->timed_out = true;
+                    return 1;  // Abort query with SQLITE_INTERRUPT
+                }
+                return 0;
+            }
+        };
+
+        timeout_state_t timeout_state;
+        const bool timeout_enabled = options.timeout_ms > 0;
+        if (timeout_enabled) {
+            timeout_state.started_at = std::chrono::steady_clock::now();
+            timeout_state.timeout_ms = options.timeout_ms;
+            const int progress_steps = options.progress_steps > 0 ? options.progress_steps : 1000;
+            sqlite3_progress_handler(db_, progress_steps, &progress_handler_t::callback, &timeout_state);
+        }
+
+        const auto query_started_at = std::chrono::steady_clock::now();
 
         // Get column names
         int col_count = sqlite3_column_count(stmt);
@@ -291,7 +346,7 @@ public:
         }
 
         // Fetch rows
-        while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        while ((rc = sqlite3_step(stmt)) == to_sqlite_status(Status::row)) {
             Row row;
             row.values.reserve(col_count);
             for (int i = 0; i < col_count; ++i) {
@@ -302,7 +357,26 @@ public:
             result.rows.push_back(std::move(row));
         }
 
-        if (rc != SQLITE_DONE) {
+        result.elapsed_ms = static_cast<int>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - query_started_at).count());
+
+        if (timeout_enabled) {
+            // Clear progress handler after this statement.
+            sqlite3_progress_handler(db_, 0, nullptr, nullptr);
+        }
+
+        const bool timed_out = timeout_enabled && timeout_state.timed_out;
+        if (timed_out) {
+            result.timed_out = true;
+            if (col_count > 0) {
+                // SELECT-like statements return partial results collected so far.
+                result.partial = true;
+                result.warnings.push_back("query timed out; returning partial rows");
+            } else {
+                result.error = "Query timed out";
+            }
+        } else if (rc != to_sqlite_status(Status::done)) {
             result.error = sqlite3_errmsg(db_);
         }
 
@@ -312,6 +386,10 @@ public:
 
     Result query(const std::string& sql) {
         return query(sql.c_str());
+    }
+
+    Result query(const std::string& sql, const QueryOptions& options) {
+        return query(sql.c_str(), options);
     }
 
     /**
@@ -329,10 +407,10 @@ public:
         return scalar(sql.c_str());
     }
 
-    int exec(const char* sql) {
+    Status exec(const char* sql) {
         if (!db_) {
             last_error_ = "Database not open";
-            return SQLITE_ERROR;
+            return Status::error;
         }
 
         char* err = nullptr;
@@ -340,15 +418,15 @@ public:
         if (err) {
             last_error_ = err;
             sqlite3_free(err);
-        } else if (rc != SQLITE_OK) {
+        } else if (!is_ok(rc)) {
             last_error_ = sqlite3_errmsg(db_);
         } else {
             last_error_.clear();
         }
-        return rc;
+        return to_status(rc);
     }
 
-    int exec(const std::string& sql) {
+    Status exec(const std::string& sql) {
         return exec(sql.c_str());
     }
 
@@ -358,7 +436,7 @@ public:
     int exec(const char* sql, int (*callback)(void*, int, char**, char**), void* data) {
         if (!db_) {
             last_error_ = "Database not open";
-            return SQLITE_ERROR;
+            return to_sqlite_status(Status::error);
         }
 
         char* err = nullptr;
@@ -366,12 +444,48 @@ public:
         if (err) {
             last_error_ = err;
             sqlite3_free(err);
-        } else if (rc != SQLITE_OK) {
+        } else if (!is_ok(rc)) {
             last_error_ = sqlite3_errmsg(db_);
         } else {
             last_error_.clear();
         }
         return rc;
+    }
+
+    bool execute_script(const std::string& script,
+                        std::vector<StatementResult>& results,
+                        std::string& error) {
+        if (!db_) {
+            error = "Database not open";
+            last_error_ = error;
+            return false;
+        }
+
+        bool ok = xsql::execute_script(db_, script, results, error);
+        if (ok) {
+            last_error_.clear();
+        } else {
+            last_error_ = error;
+        }
+        return ok;
+    }
+
+    bool export_tables(const std::vector<std::string>& tables,
+                       const std::string& output_path,
+                       std::string& error) {
+        if (!db_) {
+            error = "Database not open";
+            last_error_ = error;
+            return false;
+        }
+
+        bool ok = xsql::export_tables(db_, tables, output_path, error);
+        if (ok) {
+            last_error_.clear();
+        } else {
+            last_error_ = error;
+        }
+        return ok;
     }
 
     // ========================================================================
