@@ -40,6 +40,7 @@
 #endif
 
 #include <xsql/json.hpp>
+#include <xsql/thinclient/clipboard.hpp>
 
 #include <atomic>
 #include <cctype>
@@ -396,7 +397,7 @@ private:
                 "  GET  /status   - Health check\n"
                 "  POST /shutdown - Stop server\n\n"
                 "Example: curl -X POST http://localhost:" + std::to_string(port) +
-                "/query -d \"SELECT name FROM funcs LIMIT 5\"\n";
+                "/query -d \"SELECT name FROM sqlite_master WHERE type='table' LIMIT 10\"\n";
             res.set_content(welcome, "text/plain");
         });
 
@@ -489,35 +490,50 @@ private:
 /**
  * Format HTTP server info for display.
  */
-inline std::string format_http_info(const std::string& tool, int port,
-                                     const std::string& stop_hint = "Press Ctrl+C to stop and return to REPL.") {
+inline std::string format_http_info(const std::string& tool,
+                                    int port,
+                                    const std::string& bind_addr,
+                                    const std::string& stop_hint = "Press Ctrl+C to stop and return to REPL.") {
     std::ostringstream ss;
+    const std::string rendered_host = format_url_host(bind_addr);
     ss << "HTTP server started on port " << port << "\n";
-    ss << "URL: http://127.0.0.1:" << port << "\n\n";
+    ss << "URL: http://" << rendered_host << ":" << port << "\n\n";
     ss << "Endpoints:\n";
     ss << "  GET  /help     - API documentation\n";
     ss << "  POST /query    - Execute SQL query\n";
     ss << "  GET  /status   - Health check\n";
     ss << "  POST /shutdown - Stop server\n\n";
     ss << "Example:\n";
-    ss << "  curl -X POST http://127.0.0.1:" << port << "/query -d \"SELECT name FROM funcs LIMIT 5\"\n\n";
+    ss << "  curl -X POST http://" << rendered_host << ":" << port
+       << "/query -d \"SELECT name FROM sqlite_master WHERE type='table' LIMIT 10\"\n\n";
     ss << stop_hint << "\n";
     return ss.str();
+}
+
+inline std::string format_http_info(const std::string& tool,
+                                    int port,
+                                    const std::string& stop_hint = "Press Ctrl+C to stop and return to REPL.") {
+    return format_http_info(tool, port, "127.0.0.1", stop_hint);
 }
 
 /**
  * Format HTTP server status.
  */
-inline std::string format_http_status(int port, bool running) {
+inline std::string format_http_status(int port, bool running, const std::string& bind_addr) {
     std::ostringstream ss;
+    const std::string rendered_host = format_url_host(bind_addr);
     if (running) {
         ss << "HTTP server running on port " << port << "\n";
-        ss << "URL: http://127.0.0.1:" << port << "\n";
+        ss << "URL: http://" << rendered_host << ":" << port << "\n";
     } else {
         ss << "HTTP server not running\n";
         ss << "Use '.http start' to start\n";
     }
     return ss.str();
+}
+
+inline std::string format_http_status(int port, bool running) {
+    return format_http_status(port, running, "127.0.0.1");
 }
 
 }  // namespace xsql::thinclient
@@ -566,7 +582,9 @@ public:
     void set_interrupt_check(std::function<bool()>) {}
 };
 
+inline std::string format_http_info(const std::string&, int, const std::string&, const std::string& = "") { return ""; }
 inline std::string format_http_info(const std::string&, int, const std::string& = "") { return ""; }
+inline std::string format_http_status(int, bool, const std::string&) { return ""; }
 inline std::string format_http_status(int, bool) { return ""; }
 
 }  // namespace xsql::thinclient

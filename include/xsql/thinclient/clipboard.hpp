@@ -28,10 +28,20 @@
 namespace xsql::thinclient {
 
 inline std::string normalize_clipboard_host(const std::string& host) {
-    if (host.empty() || host == "0.0.0.0" || host == "::" || host == "[::]" || host == "*") {
+    if (host.empty()) {
         return "127.0.0.1";
     }
     return host;
+}
+
+inline std::string format_url_host(const std::string& host) {
+    std::string normalized = normalize_clipboard_host(host);
+    if (!normalized.empty() &&
+        normalized.front() != '[' &&
+        normalized.find(':') != std::string::npos) {
+        normalized = "[" + normalized + "]";
+    }
+    return normalized;
 }
 
 inline std::string build_http_clipboard_payload(
@@ -43,7 +53,7 @@ inline std::string build_http_clipboard_payload(
     const std::string& server_label = "")
 {
     std::ostringstream ss;
-    const std::string normalized_host = normalize_clipboard_host(host);
+    const std::string normalized_host = format_url_host(host);
     const std::string connect_label = connect_with_label.empty() ? tool_name : connect_with_label;
     const std::string rendered_server_label = server_label.empty() ? tool_name : server_label;
     ss << "Use " << connect_label << " to connect to this " << rendered_server_label
@@ -59,7 +69,7 @@ inline std::string build_mcp_clipboard_payload(
     int port)
 {
     std::ostringstream ss;
-    const std::string normalized_host = normalize_clipboard_host(host);
+    const std::string normalized_host = format_url_host(host);
     ss << "{\n";
     ss << "  \"mcpServers\": {\n";
     ss << "    \"" << server_name << "\": {\n";
@@ -91,11 +101,57 @@ inline bool parse_started_port(const std::string& output, const std::string& pre
     return true;
 }
 
+inline bool extract_url_host_from_output_line(const std::string& output,
+                                              const std::string& prefix,
+                                              std::string& out_host) {
+    const size_t prefix_pos = output.find(prefix);
+    if (prefix_pos == std::string::npos) {
+        return false;
+    }
+
+    const size_t url_start = prefix_pos + prefix.size();
+    const size_t url_end = output.find_first_of("\r\n", url_start);
+    const std::string url = output.substr(url_start, url_end == std::string::npos
+                                                       ? std::string::npos
+                                                       : url_end - url_start);
+    if (url.empty()) {
+        return false;
+    }
+
+    size_t host_start = 0;
+    const size_t scheme_pos = url.find("://");
+    if (scheme_pos != std::string::npos) {
+        host_start = scheme_pos + 3;
+    }
+    if (host_start >= url.size()) {
+        return false;
+    }
+
+    if (url[host_start] == '[') {
+        const size_t bracket_end = url.find(']', host_start + 1);
+        if (bracket_end == std::string::npos) {
+            return false;
+        }
+        out_host = url.substr(host_start, bracket_end - host_start + 1);
+        return !out_host.empty();
+    }
+
+    const size_t port_sep = url.rfind(':');
+    if (port_sep == std::string::npos || port_sep <= host_start) {
+        return false;
+    }
+
+    out_host = url.substr(host_start, port_sep - host_start);
+    return !out_host.empty();
+}
+
 inline bool extract_http_start_endpoint(const std::string& output, std::string& out_host, int& out_port) {
     if (!parse_started_port(output, "HTTP server started on port ", out_port)) {
         return false;
     }
-    out_host = "127.0.0.1";
+    if (!extract_url_host_from_output_line(output, "URL: ", out_host)) {
+        out_host = "127.0.0.1";
+    }
     return true;
 }
 
@@ -103,7 +159,9 @@ inline bool extract_mcp_start_endpoint(const std::string& output, std::string& o
     if (!parse_started_port(output, "MCP server started on port ", out_port)) {
         return false;
     }
-    out_host = "127.0.0.1";
+    if (!extract_url_host_from_output_line(output, "SSE endpoint: ", out_host)) {
+        out_host = "127.0.0.1";
+    }
     return true;
 }
 
