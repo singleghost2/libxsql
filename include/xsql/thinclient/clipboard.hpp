@@ -38,11 +38,16 @@ inline std::string build_http_clipboard_payload(
     const std::string& tool_name,
     const std::string& host,
     int port,
-    const std::string& sample_sql = "SELECT name FROM funcs LIMIT 5")
+    const std::string& sample_sql = "SELECT 1",
+    const std::string& connect_with_label = "",
+    const std::string& server_label = "")
 {
     std::ostringstream ss;
     const std::string normalized_host = normalize_clipboard_host(host);
-    ss << "Use " << tool_name << " to connect to this " << tool_name << " HTTP server.\n";
+    const std::string connect_label = connect_with_label.empty() ? tool_name : connect_with_label;
+    const std::string rendered_server_label = server_label.empty() ? tool_name : server_label;
+    ss << "Use " << connect_label << " to connect to this " << rendered_server_label
+       << " HTTP server.\n";
     ss << "curl -X POST http://" << normalized_host << ":" << port
        << "/query -d \"" << sample_sql << "\"";
     return ss.str();
