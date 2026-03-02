@@ -334,6 +334,13 @@ inline int vtab_eof(sqlite3_vtab_cursor* pCursor) {
 // xColumn - fetches live data each time
 inline int vtab_column(sqlite3_vtab_cursor* pCursor, sqlite3_context* ctx, int col) {
     auto* cursor = reinterpret_cast<Cursor*>(pCursor);
+
+    // During UPDATE, SQLite may ask for unchanged column values. Returning
+    // without a value marks the column as SQLITE_NOCHANGE in xUpdate.
+    if (sqlite3_vtab_nochange(ctx)) {
+        return to_sqlite_status(Status::ok);
+    }
+
     if (col < 0 || static_cast<size_t>(col) >= cursor->def->columns.size()) {
         sqlite3_result_null(ctx);
         return to_sqlite_status(Status::ok);
@@ -527,7 +534,7 @@ inline int vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** argv, sqli
 // Create module with xUpdate support
 inline sqlite3_module create_module() {
     sqlite3_module mod = {};
-    mod.iVersion = 0;
+    mod.iVersion = 1;
     mod.xCreate = vtab_connect;
     mod.xConnect = vtab_connect;
     mod.xBestIndex = vtab_best_index;
@@ -1073,6 +1080,13 @@ inline int cached_vtab_eof(sqlite3_vtab_cursor* pCursor) {
 template<typename RowData>
 inline int cached_vtab_column(sqlite3_vtab_cursor* pCursor, sqlite3_context* ctx, int col) {
     auto* cursor = reinterpret_cast<CachedCursor<RowData>*>(pCursor);
+
+    // During UPDATE, SQLite may ask for unchanged column values. Returning
+    // without a value marks the column as SQLITE_NOCHANGE in xUpdate.
+    if (sqlite3_vtab_nochange(ctx)) {
+        return to_sqlite_status(Status::ok);
+    }
+
     if (col < 0 || static_cast<size_t>(col) >= cursor->def->columns.size()) {
         sqlite3_result_null(ctx);
         return to_sqlite_status(Status::ok);
@@ -1398,7 +1412,7 @@ inline int cached_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** arg
 template<typename RowData>
 inline sqlite3_module create_cached_module() {
     sqlite3_module mod = {};
-    mod.iVersion = 0;
+    mod.iVersion = 1;
     mod.xCreate = cached_vtab_connect<RowData>;
     mod.xConnect = cached_vtab_connect<RowData>;
     mod.xBestIndex = cached_vtab_best_index<RowData>;
@@ -1972,7 +1986,7 @@ inline int generator_vtab_update(sqlite3_vtab*, int, sqlite3_value**, sqlite3_in
 template<typename RowData>
 inline sqlite3_module create_generator_module() {
     sqlite3_module mod = {};
-    mod.iVersion = 0;
+    mod.iVersion = 1;
     mod.xCreate = generator_vtab_connect<RowData>;
     mod.xConnect = generator_vtab_connect<RowData>;
     mod.xBestIndex = generator_vtab_best_index<RowData>;
