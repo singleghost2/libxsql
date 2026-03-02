@@ -53,6 +53,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <exception>
 
 namespace xsql::thinclient {
 
@@ -419,36 +420,60 @@ private:
                 return;
             }
 
-            std::string result;
-            if (config_.use_queue) {
-                result = queue_and_wait(req.body);
-            } else {
-                if (!config_.query_fn) {
-                    res.status = 500;
-                    res.set_content(
-                        xsql::json{{"success", false}, {"error", "Query callback not set"}}.dump(),
-                        "application/json");
-                    return;
+            try {
+                std::string result;
+                if (config_.use_queue) {
+                    result = queue_and_wait(req.body);
+                } else {
+                    if (!config_.query_fn) {
+                        res.status = 500;
+                        res.set_content(
+                            xsql::json{{"success", false}, {"error", "Query callback not set"}}.dump(),
+                            "application/json");
+                        return;
+                    }
+                    result = config_.query_fn(req.body);
                 }
-                result = config_.query_fn(req.body);
+                res.set_content(result, "application/json");
+            } catch (const std::exception& e) {
+                res.status = 500;
+                res.set_content(
+                    xsql::json{{"success", false}, {"error", e.what()}}.dump(),
+                    "application/json");
+            } catch (...) {
+                res.status = 500;
+                res.set_content(
+                    xsql::json{{"success", false}, {"error", "Unhandled query exception"}}.dump(),
+                    "application/json");
             }
-            res.set_content(result, "application/json");
         });
 
         // GET /status - Server status
         svr.Get("/status", [this](const httplib::Request& req, httplib::Response& res) {
             if (!check_auth(req, res)) return;
 
-            xsql::json status = {
-                {"success", true},
-                {"status", "ok"},
-                {"tool", config_.tool_name}
-            };
-            if (config_.status_fn) {
-                auto extra = config_.status_fn();
-                status.merge_patch(extra);
+            try {
+                xsql::json status = {
+                    {"success", true},
+                    {"status", "ok"},
+                    {"tool", config_.tool_name}
+                };
+                if (config_.status_fn) {
+                    auto extra = config_.status_fn();
+                    status.merge_patch(extra);
+                }
+                res.set_content(status.dump(), "application/json");
+            } catch (const std::exception& e) {
+                res.status = 500;
+                res.set_content(
+                    xsql::json{{"success", false}, {"error", e.what()}}.dump(),
+                    "application/json");
+            } catch (...) {
+                res.status = 500;
+                res.set_content(
+                    xsql::json{{"success", false}, {"error", "Unhandled status exception"}}.dump(),
+                    "application/json");
             }
-            res.set_content(status.dump(), "application/json");
         });
 
         // POST /shutdown - Graceful shutdown
