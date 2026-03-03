@@ -891,6 +891,7 @@ struct CachedTableDef {
     std::function<bool(int argc, FunctionArg* argv)> insert_row;
     bool supports_insert = false;
     std::function<void(const std::string&)> before_modify;
+    std::function<void(const std::string&)> after_modify;
 
     // Populate a RowData from xUpdate argv values (argv[2..] = column values).
     // Used when the shared cache is not available (e.g., filter_eq path).
@@ -1318,6 +1319,7 @@ inline int cached_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** arg
             return to_sqlite_status(Status::error);
         }
         def->invalidate_cache();
+        if (def->after_modify) def->after_modify("DELETE FROM " + def->name);
         return to_sqlite_status(Status::ok);
     }
 
@@ -1382,6 +1384,7 @@ inline int cached_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** arg
             }
         }
         def->invalidate_cache();
+        if (def->after_modify) def->after_modify("UPDATE " + def->name);
         return to_sqlite_status(Status::ok);
     }
 
@@ -1403,6 +1406,7 @@ inline int cached_vtab_update(sqlite3_vtab* pVtab, int argc, sqlite3_value** arg
             return to_sqlite_status(Status::error);
         }
         def->invalidate_cache();
+        if (def->after_modify) def->after_modify("INSERT INTO " + def->name);
         return to_sqlite_status(Status::ok);
     }
 
@@ -1488,6 +1492,18 @@ public:
 
     CachedTableBuilder& on_modify(std::function<void(const std::string&)> fn) {
         def_.before_modify = std::move(fn);
+        return *this;
+    }
+
+    CachedTableBuilder& after_modify(std::function<void(const std::string&)> fn) {
+        def_.after_modify = std::move(fn);
+        return *this;
+    }
+
+    CachedTableBuilder& column(const char* name,
+                               ColumnType type,
+                               std::function<void(FunctionContext&, const RowData&)> getter) {
+        def_.columns.emplace_back(name, type, false, std::move(getter), nullptr);
         return *this;
     }
 
