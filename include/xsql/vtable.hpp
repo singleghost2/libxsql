@@ -1084,7 +1084,11 @@ inline int cached_vtab_column(sqlite3_vtab_cursor* pCursor, sqlite3_context* ctx
 
     // During UPDATE, SQLite may ask for unchanged column values. Returning
     // without a value marks the column as SQLITE_NOCHANGE in xUpdate.
-    if (sqlite3_vtab_nochange(ctx)) {
+    // Only safe when the update handler can look up the original row by rowid
+    // in the shared cache. Without shared cache, row_from_argv needs real
+    // column values — returning NOCHANGE would cause it to read 0/NULL for
+    // unchanged fields like ea or func_addr, breaking write operations.
+    if (sqlite3_vtab_nochange(ctx) && cursor->def->use_shared_cache) {
         return to_sqlite_status(Status::ok);
     }
 
