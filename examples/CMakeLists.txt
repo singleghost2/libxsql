@@ -12,3 +12,7 @@ target_link_libraries(example_writable_table PRIVATE xsql::xsql)
 add_executable(example_cached_table cached_table.cpp)
 target_link_libraries(example_cached_table PRIVATE xsql::xsql)
 
+# Repro: NOCHANGE bug with no_shared_cache + filter_eq + row_populator
+add_executable(repro_nochange_bug repro_nochange_bug.cpp)
+target_link_libraries(repro_nochange_bug PRIVATE xsql::xsql)
+
